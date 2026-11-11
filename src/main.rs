@@ -1951,6 +1951,10 @@ fn finish_session(state: &mut State) {
         warn(&e);
     }
     report.lock = None;
+    if report.test.is_object() {
+        let model = report.test["model"].as_str().unwrap_or("").to_string();
+        stand_in_for_runner(&report.dir, &model);
+    }
 }
 
 // ---------------------------------------------------------------- MCP server
@@ -3047,19 +3051,24 @@ fn file_reply(reports: &Path, run: &str, sub: Option<&str>, name: &str, range: O
     }
 }
 
-/// `phantomqa serve`: runs until stopped.
+/// `phantomqa serve`: the API and the routines, until stopped. `--no-api`: the routines only.
 fn serve(args: &[&str]) -> Result<String, String> {
+    let config = config();
     let listen = match args {
         [] => env_var("PHANTOMQA_LISTEN").unwrap_or_else(|| DEFAULT_LISTEN.into()),
         ["--listen", addr] => addr.to_string(),
-        _ => return Err(format!("usage: phantomqa serve [--listen {DEFAULT_LISTEN}]")),
+        ["--no-api"] => return serve_routines_only(),
+        _ => {
+            return Err(format!(
+                "usage: phantomqa serve [--listen {DEFAULT_LISTEN}]  (API and routines)\n       phantomqa serve --no-api           (routines only, no tokens needed)"
+            ));
+        }
     };
     let addr = std::net::ToSocketAddrs::to_socket_addrs(&listen)
         .map_err(|e| format!("not an address to listen on: {listen:?} ({e})"))?
         .next()
         .ok_or_else(|| format!("not an address to listen on: {listen:?}"))?;
 
-    let config = config();
     // Refuse to start an API nobody can use, and say why.
     let active = load_tokens(&config.tokens)?
         .iter()
@@ -3067,7 +3076,7 @@ fn serve(args: &[&str]) -> Result<String, String> {
         .count();
     if active == 0 {
         return Err(format!(
-            "no tokens in {}: create one first with `phantomqa token add NAME`",
+            "no tokens in {}: create one first with `phantomqa token add NAME`, or run only the routines with `phantomqa serve --no-api`",
             config.tokens.display()
         ));
     }
@@ -3105,6 +3114,24 @@ fn serve(args: &[&str]) -> Result<String, String> {
     for worker in workers {
         let _ = worker.join();
     }
+    Ok(String::new())
+}
+
+/// `phantomqa serve --no-api`: no listener and no tokens, only the routines.
+fn serve_routines_only() -> Result<String, String> {
+    let config = config();
+    // Without the API, a missing file leaves nothing to do: most likely a wrong path.
+    if read_routines_file(&config.routines)?.is_none() {
+        return Err(format!(
+            "{} not found: with --no-api, serve has nothing to do. Create it, or set --routines or PHANTOMQA_ROUTINES.",
+            config.routines.display()
+        ));
+    }
+    fs::create_dir_all(&config.reports).map_err(|e| format!("cannot create {}: {e}", config.reports.display()))?;
+    let _ = writeln!(std::io::stderr(), "PhantomQA routines (no API)");
+    let _ = writeln!(std::io::stderr(), "  reports:  {}", config.reports.display());
+    let _ = writeln!(std::io::stderr(), "  routines: {}", config.routines.display());
+    run_routines(&config.routines);
     Ok(String::new())
 }
 
@@ -3188,6 +3215,10 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 const FINISH_TIMEOUT: Duration = Duration::from_secs(400);
 /// Tells the MCP worker which run folder to take over.
 const RUN_DIR_ENV: &str = "PHANTOMQA_RUN_DIR";
+/// Held by `phantomqa run` until it has saved the agent's part. Free means phantomqa is gone.
+const RUNNER_LOCK: &str = ".runner";
+/// How long the worker waits for `phantomqa run` to save the agent's part.
+const RUNNER_WAIT: Duration = Duration::from_secs(30);
 
 /// A test file, checked.
 #[derive(Debug, PartialEq)]
@@ -3461,7 +3492,7 @@ fn mcp_config(run_dir: &Path) -> Result<Value, String> {
 
 /// How the agent's part went.
 struct AgentRun {
-    /// "done", "time limit" or "error".
+    /// "done", "time limit", "error", or "stopped" when phantomqa itself stopped during the run.
     ended: &'static str,
     summary: String,
     cost_usd: Option<f64>,
@@ -3621,6 +3652,82 @@ fn stop_with_parent(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn stop_with_parent(_: &mut Command) {}
 
+/// Adds the agent's part to run.json and report.md. Returns the number of bugs.
+fn save_agent(dir: &Path, model: &str, agent: &AgentRun) -> usize {
+    let mut doc = read_json(&dir.join("run.json")).unwrap_or_else(|_| json!({}));
+    doc["agent"] = json!({
+        "name": "claude",
+        "model": model,
+        "ended": agent.ended,
+        "summary": agent.summary,
+        "cost_usd": agent.cost_usd,
+        "turns": agent.turns,
+        "error": agent.error,
+    });
+    if let Err(e) = write_json(&dir.join("run.json"), &doc) {
+        warn(&e);
+    }
+    let mut section = format!("\n## Agent\n\n- Model: {model}\n- Ended: {}\n", agent.ended);
+    if let Some(cost) = agent.cost_usd {
+        section.push_str(&format!("- Cost: ${cost:.2}, {} turns\n", agent.turns.unwrap_or(0)));
+    }
+    if let Some(error) = &agent.error {
+        section.push_str(&format!("- Error: {error}\n"));
+    }
+    if !agent.summary.is_empty() {
+        section.push_str(&format!("\n{}\n", agent.summary));
+    }
+    let _ = fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("report.md"))
+        .and_then(|mut file| file.write_all(section.as_bytes()));
+    doc["bugs"].as_array().map_or(0, Vec::len)
+}
+
+/// `phantomqa run` holds this lock for the whole run, until the agent's part is saved.
+fn hold_runner_lock(dir: &Path) -> Result<fs::File, String> {
+    let path = dir.join(RUNNER_LOCK);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    file.try_lock()
+        .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+    Ok(file)
+}
+
+/// The worker outlives `phantomqa run`. When phantomqa stops during a run (killed, or serve
+/// stopped), the agent stops with it and nobody else saves the agent's part, so the worker
+/// saves it as "stopped".
+fn stand_in_for_runner(dir: &Path, model: &str) {
+    let has_agent = || read_json(&dir.join("run.json")).is_ok_and(|doc| doc["agent"].is_object());
+    // No lock file: not a run of this version; nothing to watch.
+    let Ok(file) = fs::OpenOptions::new().write(true).open(dir.join(RUNNER_LOCK)) else {
+        return;
+    };
+    let start = Instant::now();
+    while start.elapsed() < RUNNER_WAIT && !has_agent() {
+        // Free only when phantomqa is gone. Holding it, the check and the write cannot race with it.
+        if file.try_lock().is_ok() {
+            if !has_agent() {
+                let _ = fs::remove_file(dir.join(".mcp.json"));
+                let stopped = AgentRun {
+                    ended: "stopped",
+                    summary: String::new(),
+                    cost_usd: None,
+                    turns: None,
+                    error: Some("phantomqa stopped during the run, so the agent stopped too".into()),
+                };
+                save_agent(dir, model, &stopped);
+            }
+            return;
+        }
+        sleep(Duration::from_millis(200));
+    }
+}
+
 /// Waits until the worker has finished the session, or is gone.
 fn wait_for_finish(run_dir: &Path) -> bool {
     let start = Instant::now();
@@ -3679,6 +3786,8 @@ fn run_test(path: &Path, routine: Option<&str>) -> Result<(String, i32), String>
     }
     let mut report = create_run(&config.reports, info)?;
     let dir = report.dir.clone();
+    // Held to the end: while it is held, the worker knows phantomqa will add the agent's part.
+    let _runner = hold_runner_lock(&dir)?;
     let mcp_file = dir.join(".mcp.json");
     write_json(&mcp_file, &mcp_config(&dir)?)?;
     warn(&format!(
@@ -3701,37 +3810,10 @@ fn run_test(path: &Path, routine: Option<&str>) -> Result<(String, i32), String>
         );
     }
 
-    let mut doc = read_json(&dir.join("run.json")).unwrap_or_else(|_| json!({}));
     let mut state = State::new(config.reports.clone());
     state.password_env = test.login.as_ref().map(|l| l.password_env.clone());
-    let summary = redact(&state, agent.summary.clone());
-    doc["agent"] = json!({
-        "name": "claude",
-        "model": test.model,
-        "ended": agent.ended,
-        "summary": summary,
-        "cost_usd": agent.cost_usd,
-        "turns": agent.turns,
-        "error": agent.error,
-    });
-    if let Err(e) = write_json(&dir.join("run.json"), &doc) {
-        warn(&e);
-    }
-    let bugs = doc["bugs"].as_array().map_or(0, Vec::len);
-    let mut section = format!("\n## Agent\n\n- Model: {}\n- Ended: {}\n", test.model, agent.ended);
-    if let Some(cost) = agent.cost_usd {
-        section.push_str(&format!("- Cost: ${cost:.2}, {} turns\n", agent.turns.unwrap_or(0)));
-    }
-    if let Some(error) = &agent.error {
-        section.push_str(&format!("- Error: {error}\n"));
-    }
-    if !summary.is_empty() {
-        section.push_str(&format!("\n{summary}\n"));
-    }
-    let _ = fs::OpenOptions::new()
-        .append(true)
-        .open(dir.join("report.md"))
-        .and_then(|mut file| file.write_all(section.as_bytes()));
+    agent.summary = redact(&state, std::mem::take(&mut agent.summary));
+    let bugs = save_agent(&dir, &test.model, &agent);
 
     let mut line = format!("run {}: {bugs} bug{}", report.run, if bugs == 1 { "" } else { "s" });
     line.push_str(&format!(", agent {}", agent.ended));
@@ -3790,6 +3872,15 @@ impl When {
             When::Every(n) if n % 60 == 0 => format!("every {}h", n / 60),
             When::Every(n) => format!("every {n}m"),
         }
+    }
+
+    /// The time between two runs.
+    fn period(self) -> Duration {
+        let minutes = match self {
+            When::At(_) => DAY_MINUTES,
+            When::Every(n) => n,
+        };
+        Duration::from_secs(u64::from(minutes) * 60)
     }
 
     /// The minutes of a day it runs at.
@@ -3991,6 +4082,8 @@ fn next_time(when: When, tz: &TimeZone, t: Timestamp) -> Option<Timestamp> {
 struct Timer {
     /// The run time handled last: started, skipped or missed.
     last: Option<Timestamp>,
+    /// When `last` was handled, as time since serve started. The wall clock can jump; this cannot.
+    handled: Option<Duration>,
     next: Option<Timestamp>,
 }
 
@@ -4004,15 +4097,23 @@ enum Due {
 fn new_timer(when: When, tz: &TimeZone, now: Timestamp) -> Timer {
     Timer {
         last: last_time(when, tz, now),
+        handled: None,
         next: next_time(when, tz, now),
     }
 }
 
-/// One check, every second. `before` is the time of the check before.
-fn tick(timer: &mut Timer, when: When, tz: &TimeZone, before: Timestamp, now: Timestamp) -> Option<Due> {
+/// One check, every second. `before` is the time of the check before, and `uptime` the time since
+/// serve started, from a clock that never jumps.
+fn tick(
+    timer: &mut Timer,
+    when: When,
+    tz: &TimeZone,
+    before: Timestamp,
+    now: Timestamp,
+    uptime: Duration,
+) -> Option<Due> {
     if now < before {
-        // The clock went back. Wait for the next time from here; `last` keeps the time that
-        // already ran from running twice.
+        // The clock went back. Wait for the next time from here.
         timer.next = next_time(when, tz, now);
     }
     let Some(next) = timer.next else {
@@ -4024,10 +4125,17 @@ fn tick(timer: &mut Timer, when: When, tz: &TimeZone, before: Timestamp, now: Ti
     }
     timer.next = next_time(when, tz, now);
     let time = last_time(when, tz, now)?;
-    if timer.last == Some(time) {
+    // The same time again means the clock went back. A small jump would run it twice within
+    // minutes, so skip it. A big one (a clock that was a day ahead, set right) runs it again,
+    // since a real period has passed.
+    let recent = timer
+        .handled
+        .is_some_and(|at| uptime.saturating_sub(at) < when.period() / 2);
+    if timer.last == Some(time) && recent {
         return None;
     }
     timer.last = Some(time);
+    timer.handled = Some(uptime);
     // After sleep, or a clock jump forward, only the latest passed time counts, once.
     if now.as_second() - time.as_second() > ROUTINE_GRACE {
         Some(Due::Missed(time))
@@ -4088,8 +4196,10 @@ fn run_routines(path: &Path) {
         warn(&format!("routines: {problem}"));
     }
     let mut before = Timestamp::now();
+    let started = Instant::now();
     loop {
         let now = Timestamp::now();
+        let uptime = started.elapsed();
         let (zone, problem) = local_zone();
         if problem != zone_problem {
             if let Some(problem) = &problem {
@@ -4157,7 +4267,7 @@ fn run_routines(path: &Path) {
                     timers.len() - 1
                 }
             };
-            match tick(&mut timers[i].2, routine.when, &tz, before, now) {
+            match tick(&mut timers[i].2, routine.when, &tz, before, now, uptime) {
                 Some(Due::Run(_)) => start_routine(routine, &running),
                 Some(Due::Missed(time)) => warn(&format!(
                     "routine {}: missed {} (the machine was asleep, or its clock jumped); waiting for the next time",
@@ -4344,6 +4454,7 @@ commands:
   token ...           API tokens: add, rotate, remove, list, check (see `phantomqa token`)
   serve [--listen ADDR]  read-only HTTP API over the reports (default 127.0.0.1:7070, env PHANTOMQA_LISTEN),
                       and runs the tests in routines.json on schedule
+  serve --no-api      only the routines: no API, no tokens needed
   routines            check routines.json and its test files, and show when each runs next
 
 options (each also has an env var):
@@ -5781,11 +5892,13 @@ mod tests {
     /// The scheduler for one routine from `from` to `to`, one check every `step` seconds.
     fn simulate(when: When, tz: &TimeZone, from: &str, to: &str, step: i64) -> Vec<Due> {
         let (mut now, end) = (utc(from), utc(to));
+        let start = now;
         let mut timer = new_timer(when, tz, now);
         let mut before = now;
         let mut out = Vec::new();
         while now <= end {
-            out.extend(tick(&mut timer, when, tz, before, now));
+            let uptime = Duration::from_secs((now.as_second() - start.as_second()) as u64);
+            out.extend(tick(&mut timer, when, tz, before, now, uptime));
             before = now;
             now = Timestamp::from_second(now.as_second() + step).unwrap();
         }
@@ -6013,35 +6126,75 @@ mod tests {
     fn routines_skip_missed_times_and_clock_jumps() {
         let zone = TimeZone::UTC;
         let when = When::At(180);
+        // `awake`: minutes since serve started, on the clock that never jumps.
         let mut timer = new_timer(when, &zone, utc("2026-11-11T03:00:00Z"));
-        let mut step = |before: &str, now: &str| tick(&mut timer, when, &zone, utc(before), utc(now));
+        let mut step = |before: &str, now: &str, awake: u64| {
+            tick(
+                &mut timer,
+                when,
+                &zone,
+                utc(before),
+                utc(now),
+                Duration::from_secs(awake * 60),
+            )
+        };
         assert_eq!(
-            step("2026-11-11T03:00:00Z", "2026-11-11T03:00:01Z"),
+            step("2026-11-11T03:00:00Z", "2026-11-11T03:00:01Z", 0),
             None,
             "added at 03:00: waits for tomorrow"
         );
         assert_eq!(
-            step("2026-11-12T02:59:59Z", "2026-11-12T03:00:00Z"),
+            step("2026-11-12T02:59:59Z", "2026-11-12T03:00:00Z", 1440),
             Some(Due::Run(utc("2026-11-12T03:00:00Z")))
         );
-        assert_eq!(step("2026-11-12T03:00:00Z", "2026-11-12T03:00:01Z"), None, "once");
+        assert_eq!(step("2026-11-12T03:00:00Z", "2026-11-12T03:00:01Z", 1440), None, "once");
         // The clock goes back half an hour: 03:00 does not run again.
-        assert_eq!(step("2026-11-12T03:00:01Z", "2026-11-12T02:30:01Z"), None);
-        assert_eq!(step("2026-11-12T02:59:59Z", "2026-11-12T03:00:02Z"), None, "not twice");
+        assert_eq!(step("2026-11-12T03:00:01Z", "2026-11-12T02:30:01Z", 1441), None);
+        assert_eq!(
+            step("2026-11-12T02:59:59Z", "2026-11-12T03:00:02Z", 1471),
+            None,
+            "not twice"
+        );
         // Asleep from 02:00 to 05:00: 03:00 is missed, said once, and not made up.
         assert_eq!(
-            step("2026-11-13T02:00:00Z", "2026-11-13T05:00:00Z"),
+            step("2026-11-13T02:00:00Z", "2026-11-13T05:00:00Z", 2800),
             Some(Due::Missed(utc("2026-11-13T03:00:00Z")))
         );
-        assert_eq!(step("2026-11-13T05:00:00Z", "2026-11-13T05:00:01Z"), None);
+        assert_eq!(step("2026-11-13T05:00:00Z", "2026-11-13T05:00:01Z", 2800), None);
         // Waking up less than a minute late still runs it; later is missed.
         assert_eq!(
-            step("2026-11-14T02:00:00Z", "2026-11-14T03:01:00Z"),
+            step("2026-11-14T02:00:00Z", "2026-11-14T03:01:00Z", 4000),
             Some(Due::Run(utc("2026-11-14T03:00:00Z")))
         );
         assert_eq!(
-            step("2026-11-15T02:00:00Z", "2026-11-15T03:01:01Z"),
+            step("2026-11-15T02:00:00Z", "2026-11-15T03:01:01Z", 5400),
             Some(Due::Missed(utc("2026-11-15T03:00:00Z")))
+        );
+
+        // The clock was a day ahead, then set right: the same 03:00 runs again a real day later.
+        let mut timer = new_timer(when, &zone, utc("2026-11-12T02:00:00Z"));
+        let mut step = |before: &str, now: &str, awake: u64| {
+            tick(
+                &mut timer,
+                when,
+                &zone,
+                utc(before),
+                utc(now),
+                Duration::from_secs(awake * 60),
+            )
+        };
+        assert_eq!(
+            step("2026-11-12T02:59:59Z", "2026-11-12T03:00:00Z", 60),
+            Some(Due::Run(utc("2026-11-12T03:00:00Z")))
+        );
+        assert_eq!(
+            step("2026-11-12T05:00:00Z", "2026-11-11T05:00:00Z", 180),
+            None,
+            "set back"
+        );
+        assert_eq!(
+            step("2026-11-12T02:59:59Z", "2026-11-12T03:00:00Z", 60 + 1440),
+            Some(Due::Run(utc("2026-11-12T03:00:00Z")))
         );
 
         // Every 15m, asleep for two hours: one missed note, then on time again.
@@ -6055,15 +6208,101 @@ mod tests {
         assert_eq!(found, [Due::Run(utc("2026-11-11T10:15:00Z"))]);
         let when = When::Every(15);
         let mut timer = new_timer(when, &zone, utc("2026-11-11T10:00:00Z"));
-        let mut step = |before: &str, now: &str| tick(&mut timer, when, &zone, utc(before), utc(now));
+        let mut step = |before: &str, now: &str, awake: u64| {
+            tick(
+                &mut timer,
+                when,
+                &zone,
+                utc(before),
+                utc(now),
+                Duration::from_secs(awake * 60),
+            )
+        };
         assert_eq!(
-            step("2026-11-11T10:00:00Z", "2026-11-11T12:05:00Z"),
+            step("2026-11-11T10:00:00Z", "2026-11-11T12:05:00Z", 3),
             Some(Due::Missed(utc("2026-11-11T12:00:00Z")))
         );
         assert_eq!(
-            step("2026-11-11T12:05:00Z", "2026-11-11T12:15:00Z"),
+            step("2026-11-11T12:05:00Z", "2026-11-11T12:15:00Z", 13),
             Some(Due::Run(utc("2026-11-11T12:15:00Z")))
         );
+        // Every 15m, the clock goes back 30 minutes: the times in between run again, since real
+        // time passes; only the same time within half a period is skipped.
+        assert_eq!(step("2026-11-11T12:15:00Z", "2026-11-11T11:45:01Z", 13), None);
+        assert_eq!(
+            step("2026-11-11T11:59:59Z", "2026-11-11T12:00:00Z", 28),
+            Some(Due::Run(utc("2026-11-11T12:00:00Z")))
+        );
+        assert_eq!(
+            step("2026-11-11T12:14:59Z", "2026-11-11T12:15:00Z", 43),
+            Some(Due::Run(utc("2026-11-11T12:15:00Z"))),
+            "30 real minutes after it ran"
+        );
+    }
+
+    #[test]
+    fn worker_saves_the_agent_part_when_phantomqa_is_gone() {
+        let root = std::env::temp_dir().join(format!("phantomqa-runner-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let folder = |name: &str| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("run.json"),
+                json!({"status": "finished", "bugs": [], "test": {}}).to_string(),
+            )
+            .unwrap();
+            fs::write(dir.join("report.md"), "# report\n").unwrap();
+            dir
+        };
+        let agent_of = |dir: &Path| read_json(&dir.join("run.json")).unwrap()["agent"].clone();
+        let sections = |dir: &Path| {
+            fs::read_to_string(dir.join("report.md"))
+                .unwrap()
+                .matches("## Agent")
+                .count()
+        };
+
+        // phantomqa is gone: the worker says the run was stopped.
+        let gone = folder("gone");
+        drop(hold_runner_lock(&gone).unwrap());
+        stand_in_for_runner(&gone, "haiku");
+        assert_eq!(agent_of(&gone)["ended"], "stopped");
+        assert_eq!(agent_of(&gone)["model"], "haiku");
+        assert!(
+            fs::read_to_string(gone.join("report.md"))
+                .unwrap()
+                .contains("- Ended: stopped")
+        );
+
+        // phantomqa is alive: the worker waits, and never overwrites its part.
+        let alive = folder("alive");
+        let holder = hold_runner_lock(&alive).unwrap();
+        let writer = {
+            let alive = alive.clone();
+            std::thread::spawn(move || {
+                sleep(Duration::from_millis(300));
+                let done = AgentRun {
+                    ended: "done",
+                    summary: "all good".into(),
+                    cost_usd: Some(0.01),
+                    turns: Some(3),
+                    error: None,
+                };
+                save_agent(&alive, "haiku", &done);
+                drop(holder);
+            })
+        };
+        stand_in_for_runner(&alive, "haiku");
+        writer.join().unwrap();
+        assert_eq!(agent_of(&alive)["ended"], "done");
+        assert_eq!(sections(&alive), 1);
+
+        // A run folder without the lock file: nothing to do.
+        let old = folder("old");
+        stand_in_for_runner(&old, "haiku");
+        assert!(agent_of(&old).is_null());
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

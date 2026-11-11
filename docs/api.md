@@ -100,7 +100,7 @@ Runs started by `phantomqa run` or a routine also have `test` (the test file's s
 "agent": {"name": "claude", "model": "haiku", "ended": "done", "summary": "I opened ...", "cost_usd": 0.003, "turns": 12, "error": null}
 ```
 
-`ended` is `done`, `time limit` or `error`; `error` says why. `agent` appears when the run is over.
+`ended` is `done`, `time limit`, `error`, or `stopped` when PhantomQA itself stopped during the run (killed, or `serve` stopped); `error` says why. `agent` appears when the run is over.
 
 A bug's `files` lists only the files that exist. When no single video clip could be made (no ffmpeg), the bug has `video_parts`, such as `["video/part-003.mp4", "video/part-004.mp4"]`, instead of `video`.
 

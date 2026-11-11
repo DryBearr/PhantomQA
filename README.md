@@ -127,8 +127,9 @@ phantomqa run shop.json
 Each routine has `at` or `every`, not both.
 
 ```sh
-phantomqa routines   # check the file and each test file, and show when each runs next
-phantomqa serve      # run the routines, and the API
+phantomqa routines        # check the file and each test file, and show when each runs next
+phantomqa serve           # run the routines, and the API
+phantomqa serve --no-api  # run only the routines: no API, no tokens needed
 ```
 
 - Times are this machine's local time. Set `TZ` for another zone, like `TZ=UTC phantomqa serve`.
@@ -136,10 +137,11 @@ phantomqa serve      # run the routines, and the API
 - `serve` reads the file every second, so changes apply at once. A broken file runs nothing until it is fixed, and `serve` says why.
 - If a routine's last run is still going, it skips its turn. If another run has the device, the routine skips too. `serve` logs each skip.
 - Times missed while the machine sleeps or `serve` is down are not made up. `serve` logs a missed time once.
+- If the clock goes back, a time that just ran does not run again. If the clock was far ahead and is set right, the routine runs again once a real period has passed.
 - Each run is a normal run folder. Its `test` in `run.json` has `"routine": "nightly"`, and `report.md` has a `Routine` line.
 - Set the test files' password env vars where `serve` runs.
-- `serve` needs one API token to start, even for routines only: `phantomqa token add local`.
-- If `serve` stops during a run, the agent stops too, and the run gets no `## Agent` part.
+- If `serve` (or `phantomqa run`) stops during a run, the agent stops too (on Linux). The session still finishes, and the agent part says `stopped`.
+- With systemd, set `KillMode=mixed`, so a stop reaches `serve` first and the session can finish. Otherwise everything stops at once and the run shows as `interrupted`.
 - Try it with [examples/routines.json](examples/routines.json): `phantomqa --routines examples/routines.json routines`.
 
 ## Use by hand

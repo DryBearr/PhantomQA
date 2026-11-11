@@ -130,7 +130,7 @@
         "properties": {
           "name": { "type": "string" },
           "model": { "type": "string" },
-          "ended": { "type": "string", "enum": ["done", "time limit", "error"] },
+          "ended": { "type": "string", "enum": ["done", "time limit", "error", "stopped"], "description": "`stopped`: PhantomQA itself stopped during the run." },
           "summary": { "type": "string", "description": "The agent's own summary of the test." },
           "cost_usd": { "type": ["number", "null"] },
           "turns": { "type": ["integer", "null"] },
