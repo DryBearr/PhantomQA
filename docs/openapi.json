@@ -1,0 +1,224 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "PhantomQA API",
+    "version": "1",
+    "summary": "Read PhantomQA test runs, their bugs and their files.",
+    "license": { "name": "MIT", "identifier": "MIT" }
+  },
+  "servers": [{ "url": "http://127.0.0.1:7070" }],
+  "security": [{ "token": [] }],
+  "components": {
+    "securitySchemes": {
+      "token": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A token from `phantomqa token add NAME`, sent as `Authorization: Bearer pqa_...`."
+      }
+    },
+    "parameters": {
+      "run": {
+        "name": "run",
+        "in": "path",
+        "required": true,
+        "description": "Run number, as in `reports/run-003` (send 3).",
+        "schema": { "type": "integer", "minimum": 1, "maximum": 999999999 }
+      },
+      "name": {
+        "name": "name",
+        "in": "path",
+        "required": true,
+        "description": "File name: letters, digits, `.`, `_` and `-`, not starting with `.`.",
+        "schema": { "type": "string", "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$" }
+      },
+      "range": {
+        "name": "Range",
+        "in": "header",
+        "required": false,
+        "description": "One byte range, for example `bytes=0-1023`, `bytes=1024-` or `bytes=-500`. Several ranges or an invalid value return the whole file.",
+        "schema": { "type": "string" }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": ["unauthorized", "not_found", "bad_request", "method_not_allowed", "uri_too_long", "range_not_satisfiable"]
+              },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      },
+      "Status": {
+        "type": "string",
+        "enum": ["running", "finished", "interrupted", "unknown", "broken"],
+        "description": "`running`: the session is active. `finished`: it ended normally. `interrupted`: it stopped without finishing (killed or crashed). `unknown`: the run has no run.json (made by an older version). `broken`: run.json cannot be read."
+      },
+      "RunSummary": {
+        "type": "object",
+        "required": ["run", "status", "bugs"],
+        "properties": {
+          "run": { "type": "integer" },
+          "status": { "$ref": "#/components/schemas/Status" },
+          "bugs": { "type": "integer", "description": "Number of bugs found." }
+        }
+      },
+      "Bug": {
+        "type": "object",
+        "required": ["bug", "title", "severity", "app", "files"],
+        "properties": {
+          "bug": { "type": "integer" },
+          "title": { "type": "string" },
+          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "app": { "type": "string", "description": "Android package; empty when unknown." },
+          "files": {
+            "type": "object",
+            "description": "Only the files that exist. Fetch them with /v1/runs/{run}/files/{name}.",
+            "properties": {
+              "screenshot": { "type": "string" },
+              "log": { "type": "string" },
+              "video": { "type": "string" },
+              "video_parts": { "type": "array", "items": { "type": "string" }, "description": "Raw parts such as `video/part-003.mp4`, when no single clip could be made." }
+            }
+          }
+        }
+      },
+      "Run": {
+        "type": "object",
+        "required": ["run", "status", "device", "bugs", "session_video", "files"],
+        "properties": {
+          "run": { "type": "integer" },
+          "status": { "$ref": "#/components/schemas/Status" },
+          "device": { "type": "string" },
+          "bugs": { "type": "array", "items": { "$ref": "#/components/schemas/Bug" } },
+          "session_video": { "type": ["string", "null"], "description": "`session.mp4` once the session has ended, if video was on." },
+          "files": { "type": "array", "items": { "type": "string" }, "description": "Every file in the run folder, for example `report.md` and `video/part-001.mp4`." },
+          "error": { "type": "string", "description": "Only for status `broken`." }
+        }
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing, malformed, unknown, expired or revoked token. The same answer for all, on purpose.",
+        "headers": { "WWW-Authenticate": { "schema": { "type": "string" } } },
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "No such run or file.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    }
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Is the API up?",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ok", "version"],
+                  "properties": { "ok": { "type": "boolean" }, "version": { "type": "string" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This API description.",
+        "security": [],
+        "responses": { "200": { "description": "OpenAPI 3.1 document.", "content": { "application/json": {} } } }
+      }
+    },
+    "/v1/runs": {
+      "get": {
+        "summary": "List runs, newest first.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "How many runs to return. Default 50.",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 50 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Runs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["runs"],
+                  "properties": { "runs": { "type": "array", "items": { "$ref": "#/components/schemas/RunSummary" } } }
+                }
+              }
+            }
+          },
+          "400": { "description": "Bad limit.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/runs/{run}": {
+      "get": {
+        "summary": "One run: status, device, bugs and files.",
+        "parameters": [{ "$ref": "#/components/parameters/run" }],
+        "responses": {
+          "200": { "description": "The run.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Run" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/runs/{run}/files/{name}": {
+      "get": {
+        "summary": "A file from the run folder: report.md, screenshots, videos, logs, run.json.",
+        "parameters": [
+          { "$ref": "#/components/parameters/run" },
+          { "$ref": "#/components/parameters/name" },
+          { "$ref": "#/components/parameters/range" }
+        ],
+        "responses": {
+          "200": { "description": "The whole file. `Accept-Ranges: bytes`." },
+          "206": { "description": "The requested byte range, with `Content-Range`." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "416": { "description": "The range starts after the end of the file. `Content-Range: bytes */SIZE`." }
+        }
+      }
+    },
+    "/v1/runs/{run}/files/video/{name}": {
+      "get": {
+        "summary": "A raw video part, such as part-003.mp4, kept when ffmpeg was not available.",
+        "parameters": [
+          { "$ref": "#/components/parameters/run" },
+          { "$ref": "#/components/parameters/name" },
+          { "$ref": "#/components/parameters/range" }
+        ],
+        "responses": {
+          "200": { "description": "The whole file." },
+          "206": { "description": "The requested byte range." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "416": { "description": "The range starts after the end of the file." }
+        }
+      }
+    }
+  }
+}

@@ -81,11 +81,12 @@ phantomqa crashes                       # list crashes and ANRs in the device's 
 - The agent calls `report_bug` for other problems it finds.
 - Each bug gets a screenshot, a video clip, the app's log and the list of recent actions, so a person can follow the same path. Text typed into password fields is hidden in the report.
 
-Each test run gets the next numbered folder:
+Each MCP session gets the next numbered folder, from its first tool call:
 
 ```
 reports/run-001/
   report.md      one section per bug, and the video at the end
+  run.json       status and bugs, for the API
   bug-01.png     screenshot
   bug-01.mp4     video of the last 15-60 seconds before the bug
   bug-01.log     crash lines and the app's recent log
@@ -102,9 +103,29 @@ In an MCP session, PhantomQA records the screen with `screenrecord` in 30-second
 - If PhantomQA is killed instead of closed, `session.mp4` is not made; the parts stay in `video/`.
 - Turn video off with `--no-video`, screenshots with `--no-screenshots`.
 
+## HTTP API
+
+`phantomqa serve` starts a read-only JSON API over the reports, for a dashboard or scripts. It listens on `127.0.0.1:7070` and needs a token on every `/v1` route.
+
+```sh
+phantomqa token add dashboard
+phantomqa serve
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7070/v1/runs
+```
+
+| Endpoint | Returns |
+|---|---|
+| `GET /health` | up or not (no token) |
+| `GET /v1/runs` | runs, newest first |
+| `GET /v1/runs/{run}` | status, device, bugs and files of one run |
+| `GET /v1/runs/{run}/files/{name}` | report, screenshots, videos (with seeking), logs |
+| `GET /openapi.json` | the OpenAPI description (no token) |
+
+Full docs: [docs/api.md](docs/api.md). Each run folder also has `run.json`, the same data as `GET /v1/runs/{run}`.
+
 ## API tokens
 
-Tokens will protect the HTTP API (next step). Give each client, such as a dashboard or CI, its own token.
+Give each client, such as a dashboard or CI, its own token.
 
 ```sh
 phantomqa token add dashboard --expires 90d   # prints pqa_... once; store it in the dashboard

@@ -67,7 +67,16 @@ struct State {
 
 struct Report {
     dir: PathBuf,
+    run: usize,
+    device: String,
+    /// Number of bugs saved.
     bugs: usize,
+    /// One JSON entry per bug, for run.json.
+    bug_list: Vec<Value>,
+    finished: bool,
+    session_video: Option<String>,
+    /// Held while the session runs. The API sees a free lock on an unfinished run as "interrupted".
+    lock: Option<fs::File>,
 }
 
 impl State {
@@ -1075,11 +1084,44 @@ fn report_dir(state: &mut State) -> Result<PathBuf, String> {
     let device = device_name().unwrap_or_else(|_| "unknown".into());
     let header = format!("# PhantomQA test report: run {run}\n\n- Device: {device}\n");
     fs::write(dir.join("report.md"), header).map_err(|e| format!("cannot write report.md: {e}"))?;
-    state.report = Some(Report {
+    let lock = fs::File::create(dir.join(RUN_LOCK))
+        .ok()
+        .filter(|file| file.try_lock().is_ok());
+    let report = Report {
         dir: dir.clone(),
+        run,
+        device,
         bugs: 0,
-    });
+        bug_list: Vec::new(),
+        finished: false,
+        session_video: None,
+        lock,
+    };
+    write_run_json(&report)?;
+    state.report = Some(report);
     Ok(dir)
+}
+
+/// Hidden lock file in a run folder, held by the session while it runs.
+const RUN_LOCK: &str = ".lock";
+const RUN_FILE_VERSION: u64 = 1;
+
+/// Writes run.json atomically, so the API never reads half a file.
+fn write_run_json(report: &Report) -> Result<(), String> {
+    let doc = json!({
+        "version": RUN_FILE_VERSION,
+        "run": report.run,
+        "status": if report.finished { "finished" } else { "running" },
+        "device": report.device,
+        "bugs": report.bug_list,
+        "session_video": report.session_video,
+    });
+    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    let tmp = report.dir.join(".run.json.tmp");
+    let path = report.dir.join("run.json");
+    fs::write(&tmp, text + "\n")
+        .and_then(|()| fs::rename(&tmp, &path))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 /// The app's recent log, or recent warnings and errors when the app is not running.
@@ -1133,21 +1175,38 @@ fn save_bug(state: &mut State, bug: &Bug, extra_log: &str) -> Result<usize, Stri
     let name = format!("bug-{n:02}");
 
     let mut attachments = Vec::new();
+    let mut files = serde_json::Map::new();
     if config().screenshots {
         let saved =
             screenshot().and_then(|png| fs::write(dir.join(format!("{name}.png")), png).map_err(|e| e.to_string()));
         attachments.push(match saved {
-            Ok(()) => format!("![screenshot]({name}.png)"),
+            Ok(()) => {
+                files.insert("screenshot".into(), json!(format!("{name}.png")));
+                format!("![screenshot]({name}.png)")
+            }
             Err(e) => format!("(no screenshot: {e})"),
         });
     }
     let log = format!("{extra_log}{}", app_log(&bug.package));
     attachments.push(match fs::write(dir.join(format!("{name}.log")), log) {
-        Ok(()) => format!("Log: [{name}.log]({name}.log)"),
+        Ok(()) => {
+            files.insert("log".into(), json!(format!("{name}.log")));
+            format!("Log: [{name}.log]({name}.log)")
+        }
         Err(e) => format!("(no log: {e})"),
     });
     if let Some(video) = &mut state.video {
-        attachments.push(video_clip(video, &dir, &name));
+        let (line, videos) = video_clip(video, &dir, &name);
+        attachments.push(line);
+        match videos.as_slice() {
+            [] => {}
+            [one] if one.ends_with(&format!("{name}.mp4")) => {
+                files.insert("video".into(), json!(one));
+            }
+            parts => {
+                files.insert("video_parts".into(), json!(parts));
+            }
+        }
     }
     let section = render_bug(n, bug, &state.history, &attachments.join("\n\n"));
     fs::OpenOptions::new()
@@ -1158,6 +1217,17 @@ fn save_bug(state: &mut State, bug: &Bug, extra_log: &str) -> Result<usize, Stri
         .map_err(|e| format!("cannot write report.md: {e}"))?;
     if let Some(report) = &mut state.report {
         report.bugs = n;
+        report.bug_list.push(json!({
+            "bug": n,
+            "title": bug.title,
+            "severity": bug.severity,
+            "app": bug.package,
+            "files": files,
+        }));
+        // report.md already has the bug; a failed run.json write must not lose it.
+        if let Err(e) = write_run_json(report) {
+            eprintln!("phantomqa: {e}");
+        }
     }
     Ok(n)
 }
@@ -1308,6 +1378,14 @@ fn lock(shared: &Shared) -> MutexGuard<'_, Recorder> {
 }
 
 /// Starts recording for an MCP session, or notes why video is off.
+/// The first tool call of an MCP session starts its run: the report folder, then video.
+fn start_run(state: &mut State) {
+    if let Err(e) = report_dir(state) {
+        eprintln!("phantomqa: {e}");
+    }
+    start_video(state);
+}
+
 fn start_video(state: &mut State) {
     state.video_checked = true;
     if !config().video {
@@ -1617,22 +1695,27 @@ fn part_links(files: &[PathBuf]) -> String {
 }
 
 /// The video line for a bug: its own clip, or links to the raw parts.
-fn video_clip(video: &mut Video, run_dir: &Path, name: &str) -> String {
+/// Also returns the video files, relative to the run folder.
+fn video_clip(video: &mut Video, run_dir: &Path, name: &str) -> (String, Vec<String>) {
     let parts = match video.cut() {
         Ok(parts) => parts,
-        Err(e) => return format!("(no video: {e})"),
+        Err(e) => return (format!("(no video: {e})"), Vec::new()),
     };
     let clip = run_dir.join(format!("{name}.mp4"));
     match make_video(&parts, &clip) {
-        Ok(()) => format!("Video: [{name}.mp4]({name}.mp4)"),
+        Ok(()) => (format!("Video: [{name}.mp4]({name}.mp4)"), vec![format!("{name}.mp4")]),
         Err(e) => {
             video.parts_linked = true;
-            format!("Video parts ({e}): {}", part_links(&parts))
+            let relative = parts
+                .iter()
+                .filter_map(|p| Some(format!("video/{}", p.file_name()?.to_str()?)))
+                .collect();
+            (format!("Video parts ({e}): {}", part_links(&parts)), relative)
         }
     }
 }
 
-/// Ends the session: stops recording, makes session.mp4 and adds a video note to the report.
+/// Ends the session: stops recording, makes session.mp4, finishes report.md and run.json.
 fn finish_session(state: &mut State) {
     let note = match state.video.take() {
         Some(mut video) => {
@@ -1657,17 +1740,33 @@ fn finish_session(state: &mut State) {
         }
         None => match &state.video_off {
             Some(reason) => format!("Video was off: {reason}."),
-            None => return,
+            None => String::new(),
         },
     };
-    // Only write into a report that exists; video off and no bugs means no folder.
-    if let Some(report) = &state.report {
-        let _ = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(report.dir.join("report.md"))
-            .and_then(|mut file| file.write_all(format!("\n## Video\n\n{note}\n").as_bytes()));
+    // Only finish a run that exists: a session that never started one has no folder.
+    let Some(report) = &mut state.report else { return };
+    let mut tail = String::new();
+    if report.bugs == 0 {
+        tail.push_str("\nNo bugs found.\n");
     }
+    if !note.is_empty() {
+        tail.push_str(&format!("\n## Video\n\n{note}\n"));
+    }
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(report.dir.join("report.md"))
+        .and_then(|mut file| file.write_all(tail.as_bytes()));
+    report.finished = true;
+    report.session_video = report
+        .dir
+        .join("session.mp4")
+        .is_file()
+        .then(|| "session.mp4".to_string());
+    if let Err(e) = write_run_json(report) {
+        eprintln!("phantomqa: {e}");
+    }
+    report.lock = None;
 }
 
 // ---------------------------------------------------------------- MCP server
@@ -1754,7 +1853,7 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
             .ok_or_else(|| format!("argument {key:?} must be a string"))
     };
     if !state.video_checked {
-        start_video(state);
+        start_run(state);
     }
     // Start the crash clock before the first action, so a crash it causes is not missed.
     if state.crash_since.is_none() {
@@ -2320,6 +2419,475 @@ fn token_command(args: &[&str]) -> Result<String, String> {
     }
 }
 
+// ---------------------------------------------------------------- HTTP API
+//
+// `phantomqa serve`: a read-only JSON API over the reports folder. Every /v1 route needs a token.
+// `route` answers a request without touching the network, so tests call it directly.
+
+const OPENAPI: &str = include_str!("../docs/openapi.json");
+/// The routes, written as in openapi.json. A test checks that the two match.
+#[cfg(test)]
+const ROUTES: [&str; 6] = [
+    "/health",
+    "/openapi.json",
+    "/v1/runs",
+    "/v1/runs/{run}",
+    "/v1/runs/{run}/files/{name}",
+    "/v1/runs/{run}/files/video/{name}",
+];
+const DEFAULT_LISTEN: &str = "127.0.0.1:7070";
+const MAX_URL: usize = 2048;
+const DEFAULT_LIMIT: usize = 50;
+const MAX_LIMIT: usize = 1000;
+const SERVER_THREADS: usize = 8;
+
+enum Body {
+    Bytes(Vec<u8>),
+    /// `len` bytes of the file, from `start`.
+    File {
+        file: fs::File,
+        start: u64,
+        len: u64,
+    },
+}
+
+struct Reply {
+    status: u16,
+    headers: Vec<(&'static str, String)>,
+    body: Body,
+}
+
+impl Reply {
+    fn json(status: u16, value: &Value) -> Reply {
+        Reply {
+            status,
+            headers: vec![
+                ("Content-Type", "application/json; charset=utf-8".into()),
+                ("Cache-Control", "no-store".into()),
+            ],
+            body: Body::Bytes(serde_json::to_vec_pretty(value).unwrap_or_default()),
+        }
+    }
+
+    fn error(status: u16, code: &str, message: &str) -> Reply {
+        Reply::json(status, &json!({"error": {"code": code, "message": message}}))
+    }
+
+    fn not_found(what: &str) -> Reply {
+        Reply::error(404, "not_found", &format!("no such {what}"))
+    }
+}
+
+/// The parts of an HTTP request that `route` needs.
+struct ApiRequest<'a> {
+    method: &'a str,
+    url: &'a str,
+    authorization: Option<&'a str>,
+    range: Option<&'a str>,
+}
+
+/// Answers one request. Also returns the token's name, for the log line.
+fn route(req: &ApiRequest, reports: &Path, tokens: &Path) -> (Reply, Option<String>) {
+    if req.url.len() > MAX_URL {
+        return (Reply::error(414, "uri_too_long", "the URL is too long"), None);
+    }
+    if req.method != "GET" && req.method != "HEAD" {
+        let mut reply = Reply::error(405, "method_not_allowed", "only GET and HEAD are supported");
+        reply.headers.push(("Allow", "GET, HEAD".into()));
+        return (reply, None);
+    }
+    let (path, query) = req.url.split_once('?').unwrap_or((req.url, ""));
+    let path = if path.len() > 1 {
+        path.strip_suffix('/').unwrap_or(path)
+    } else {
+        path
+    };
+
+    match path {
+        "/health" => {
+            return (
+                Reply::json(200, &json!({"ok": true, "version": env!("CARGO_PKG_VERSION")})),
+                None,
+            );
+        }
+        "/openapi.json" => {
+            let mut reply = Reply::json(200, &Value::Null);
+            reply.body = Body::Bytes(OPENAPI.as_bytes().to_vec());
+            return (reply, None);
+        }
+        _ => {}
+    }
+    let segments: Vec<&str> = path.split('/').skip(1).collect();
+    if segments.first() != Some(&"v1") {
+        return (Reply::not_found("endpoint"), None);
+    }
+    // Check the token before anything else, so routes and runs stay hidden without one.
+    let name = match authorize(tokens, req.authorization) {
+        Ok(name) => name,
+        Err(denied) => {
+            eprintln!("phantomqa: refused {}: {denied:?}", path);
+            let mut reply = Reply::error(401, "unauthorized", "send a valid token: Authorization: Bearer pqa_...");
+            reply
+                .headers
+                .push(("WWW-Authenticate", "Bearer realm=\"phantomqa\"".into()));
+            return (reply, None);
+        }
+    };
+    let reply = match segments[1..] {
+        ["runs"] => list_runs_reply(reports, query),
+        ["runs", run] => match run_dir(reports, run) {
+            Some((n, dir)) => Reply::json(200, &run_detail(&dir, n)),
+            None => Reply::not_found("run"),
+        },
+        ["runs", run, "files", file] => file_reply(reports, run, None, file, req.range),
+        ["runs", run, "files", "video", file] => file_reply(reports, run, Some("video"), file, req.range),
+        _ => Reply::not_found("endpoint"),
+    };
+    (reply, Some(name))
+}
+
+/// "3" -> 3. Digits only, no sign, at most 9 digits, not zero.
+fn run_number(s: &str) -> Option<usize> {
+    if s.is_empty() || s.len() > 9 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok().filter(|&n| n > 0)
+}
+
+/// The folder of run `n`, if it is a real folder (not a link).
+fn run_dir(reports: &Path, run: &str) -> Option<(usize, PathBuf)> {
+    let n = run_number(run)?;
+    let dir = reports.join(format!("run-{n:03}"));
+    fs::symlink_metadata(&dir).ok().filter(|m| m.is_dir()).map(|_| (n, dir))
+}
+
+/// All run folders, newest first.
+fn list_run_dirs(reports: &Path) -> Vec<(usize, PathBuf)> {
+    let mut runs: Vec<(usize, PathBuf)> = fs::read_dir(reports)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let n = run_number(e.file_name().to_str()?.strip_prefix("run-")?)?;
+            // Only the canonical name, so "run-03" and "run-003" are not the same run twice.
+            (e.file_name().to_str()? == format!("run-{n:03}")).then(|| (n, e.path()))
+        })
+        .collect();
+    runs.sort_by_key(|run| std::cmp::Reverse(run.0));
+    runs
+}
+
+fn list_runs_reply(reports: &Path, query: &str) -> Reply {
+    let mut limit = DEFAULT_LIMIT;
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "limit" {
+            match run_number(value).filter(|&n| n <= MAX_LIMIT) {
+                Some(n) => limit = n,
+                None => return Reply::error(400, "bad_request", &format!("limit must be 1 to {MAX_LIMIT}")),
+            }
+        }
+    }
+    let runs: Vec<Value> = list_run_dirs(reports)
+        .into_iter()
+        .take(limit)
+        .map(|(n, dir)| {
+            let run = run_detail(&dir, n);
+            let bugs = run["bugs"].as_array().map_or(0, Vec::len);
+            json!({"run": n, "status": run["status"], "bugs": bugs})
+        })
+        .collect();
+    Reply::json(200, &json!({"runs": runs}))
+}
+
+/// True while a session holds the run's lock.
+fn run_is_active(dir: &Path) -> bool {
+    let Ok(file) = fs::File::open(dir.join(RUN_LOCK)) else {
+        return false;
+    };
+    matches!(file.try_lock_shared(), Err(fs::TryLockError::WouldBlock))
+}
+
+/// A run's details from its run.json, with a status that also notices killed sessions.
+fn run_detail(dir: &Path, n: usize) -> Value {
+    let files = run_files(dir);
+    let base = |status: &str| json!({"run": n, "status": status, "device": "", "bugs": [], "session_video": null, "files": files});
+    let text = match fs::read_to_string(dir.join("run.json")) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return base("unknown"),
+        Err(e) => {
+            let mut run = base("broken");
+            run["error"] = json!(format!("cannot read run.json: {e}"));
+            return run;
+        }
+    };
+    let doc = match serde_json::from_str::<Value>(&text) {
+        Ok(doc) if doc["version"].as_u64() == Some(RUN_FILE_VERSION) && doc["bugs"].is_array() => doc,
+        Ok(_) => {
+            let mut run = base("broken");
+            run["error"] = json!("run.json has an unknown layout");
+            return run;
+        }
+        Err(e) => {
+            let mut run = base("broken");
+            run["error"] = json!(format!("run.json is not valid JSON: {e}"));
+            return run;
+        }
+    };
+    let status = match doc["status"].as_str() {
+        Some("finished") => "finished",
+        Some("running") if run_is_active(dir) => "running",
+        Some("running") => "interrupted",
+        _ => "broken",
+    };
+    json!({
+        "run": n,
+        "status": status,
+        "device": doc["device"].as_str().unwrap_or(""),
+        "bugs": doc["bugs"],
+        "session_video": doc["session_video"].as_str(),
+        "files": files,
+    })
+}
+
+/// Visible files of a run folder, including video parts, sorted.
+fn run_files(dir: &Path) -> Vec<String> {
+    let names = |dir: &Path, prefix: &str| -> Vec<String> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|name| valid_file_name(name))
+            .map(|name| format!("{prefix}{name}"))
+            .collect()
+    };
+    let mut files = names(dir, "");
+    files.extend(names(&dir.join("video"), "video/"));
+    files.sort();
+    files
+}
+
+/// Letters, digits, `.`, `_` and `-`; not hidden (no leading dot), so never `..` or the lock.
+fn valid_file_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && !name.starts_with('.')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+fn content_type(name: &str) -> &'static str {
+    match name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("json") => "application/json; charset=utf-8",
+        Some("md") => "text/markdown; charset=utf-8",
+        Some("log" | "txt") => "text/plain; charset=utf-8",
+        Some("png") => "image/png",
+        Some("mp4") => "video/mp4",
+        _ => "application/octet-stream",
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ByteRange {
+    Whole,
+    /// First and last byte, both included.
+    Part(u64, u64),
+    Unsatisfiable,
+}
+
+/// One `Range: bytes=...` value. Anything this does not understand returns the whole file,
+/// which HTTP allows.
+fn parse_range(header: Option<&str>, size: u64) -> ByteRange {
+    let Some(spec) = header.and_then(|h| h.trim().strip_prefix("bytes=")) else {
+        return ByteRange::Whole;
+    };
+    if spec.contains(',') {
+        return ByteRange::Whole;
+    }
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return ByteRange::Whole;
+    };
+    let number = |s: &str| -> Option<u64> {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
+    match (number(first), number(last), last.is_empty()) {
+        // bytes=-500: the last 500 bytes.
+        (None, Some(suffix), _) if first.is_empty() => match (size, suffix) {
+            (0, _) | (_, 0) => ByteRange::Unsatisfiable,
+            _ => ByteRange::Part(size.saturating_sub(suffix), size - 1),
+        },
+        // bytes=1024-
+        (Some(start), None, true) if start < size => ByteRange::Part(start, size - 1),
+        // bytes=0-1023
+        (Some(start), Some(end), _) if start <= end && start < size => ByteRange::Part(start, end.min(size - 1)),
+        (Some(start), Some(end), _) if start <= end => ByteRange::Unsatisfiable,
+        (Some(_), None, true) => ByteRange::Unsatisfiable,
+        _ => ByteRange::Whole,
+    }
+}
+
+fn file_reply(reports: &Path, run: &str, sub: Option<&str>, name: &str, range: Option<&str>) -> Reply {
+    let Some((_, dir)) = run_dir(reports, run) else {
+        return Reply::not_found("run");
+    };
+    if !valid_file_name(name) {
+        return Reply::not_found("file");
+    }
+    let path = match sub {
+        Some(sub) => dir.join(sub).join(name),
+        None => dir.join(name),
+    };
+    // A link could point outside the reports folder, so only real files are served.
+    let Some(size) = fs::symlink_metadata(&path)
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+    else {
+        return Reply::not_found("file");
+    };
+    let Ok(file) = fs::File::open(&path) else {
+        return Reply::not_found("file");
+    };
+    let mut headers = vec![
+        ("Content-Type", content_type(name).to_string()),
+        ("Accept-Ranges", "bytes".to_string()),
+        ("Cache-Control", "private, no-cache".to_string()),
+        ("X-Content-Type-Options", "nosniff".to_string()),
+    ];
+    let (status, start, len) = match parse_range(range, size) {
+        ByteRange::Whole => (200, 0, size),
+        ByteRange::Part(first, last) => {
+            headers.push(("Content-Range", format!("bytes {first}-{last}/{size}")));
+            (206, first, last - first + 1)
+        }
+        ByteRange::Unsatisfiable => {
+            let mut reply = Reply::error(416, "range_not_satisfiable", "the range is outside the file");
+            reply.headers.push(("Content-Range", format!("bytes */{size}")));
+            return reply;
+        }
+    };
+    Reply {
+        status,
+        headers,
+        body: Body::File { file, start, len },
+    }
+}
+
+/// `phantomqa serve`: runs until stopped.
+fn serve(args: &[&str]) -> Result<String, String> {
+    let listen = match args {
+        [] => env_var("PHANTOMQA_LISTEN").unwrap_or_else(|| DEFAULT_LISTEN.into()),
+        ["--listen", addr] => addr.to_string(),
+        _ => return Err(format!("usage: phantomqa serve [--listen {DEFAULT_LISTEN}]")),
+    };
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&listen)
+        .map_err(|e| format!("not an address to listen on: {listen:?} ({e})"))?
+        .next()
+        .ok_or_else(|| format!("not an address to listen on: {listen:?}"))?;
+
+    let config = config();
+    // Refuse to start an API nobody can use, and say why.
+    let active = load_tokens(&config.tokens)?
+        .iter()
+        .filter(|t| t.expires.is_none_or(|e| now_secs() < e))
+        .count();
+    if active == 0 {
+        return Err(format!(
+            "no tokens in {}: create one first with `phantomqa token add NAME`",
+            config.tokens.display()
+        ));
+    }
+    fs::create_dir_all(&config.reports).map_err(|e| format!("cannot create {}: {e}", config.reports.display()))?;
+
+    let server = tiny_http::Server::http(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+    let server = Arc::new(server);
+    eprintln!("PhantomQA API on http://{addr}");
+    eprintln!("  reports: {}", config.reports.display());
+    eprintln!("  tokens:  {} ({active} active)", config.tokens.display());
+    if !addr.ip().is_loopback() {
+        eprintln!("  warning: listening beyond this machine over plain HTTP; put an HTTPS proxy in front");
+    }
+    let workers: Vec<_> = (0..SERVER_THREADS)
+        .map(|_| {
+            let server = server.clone();
+            std::thread::spawn(move || {
+                while let Ok(request) = server.recv() {
+                    handle_http(request, &config.reports, &config.tokens);
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        let _ = worker.join();
+    }
+    Ok(String::new())
+}
+
+/// Turns a tiny_http request into a `route` call and sends the reply.
+fn handle_http(request: tiny_http::Request, reports: &Path, tokens: &Path) {
+    let header = |name: &'static str| {
+        request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv(name))
+            .map(|h| h.value.as_str().to_string())
+    };
+    let (authorization, range) = (header("Authorization"), header("Range"));
+    let method = request.method().as_str().to_string();
+    let url = request.url().to_string();
+    let req = ApiRequest {
+        method: &method,
+        url: &url,
+        authorization: authorization.as_deref(),
+        range: range.as_deref(),
+    };
+    let (reply, who) = route(&req, reports, tokens);
+
+    let path = url.split('?').next().unwrap_or("");
+    eprintln!("{method} {path} {} {}", reply.status, who.as_deref().unwrap_or("-"));
+    let headers: Vec<tiny_http::Header> = reply
+        .headers
+        .iter()
+        .filter_map(|(k, v)| tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()).ok())
+        .collect();
+    let status = tiny_http::StatusCode(reply.status);
+    // tiny_http leaves out the body itself for HEAD requests. It would switch to chunked transfer above
+    // 32 KB and drop Content-Length, which video players and download progress need.
+    let result = match reply.body {
+        Body::Bytes(bytes) => {
+            let len = bytes.len();
+            request.respond(
+                tiny_http::Response::new(status, headers, std::io::Cursor::new(bytes), Some(len), None)
+                    .with_chunked_threshold(usize::MAX),
+            )
+        }
+        Body::File { mut file, start, len } => {
+            use std::io::Seek;
+            match file.seek(std::io::SeekFrom::Start(start)) {
+                Ok(_) => {
+                    let len = usize::try_from(len).unwrap_or(usize::MAX);
+                    request.respond(
+                        tiny_http::Response::new(status, headers, file.take(len as u64), Some(len), None)
+                            .with_chunked_threshold(usize::MAX),
+                    )
+                }
+                Err(e) => Err(e),
+            }
+        }
+    };
+    if let Err(e) = result {
+        // Usually the client went away mid-download.
+        eprintln!("phantomqa: could not send {path}: {e}");
+    }
+}
+
 // ---------------------------------------------------------------- doctor
 
 /// Prints one line per check. Returns false if something required is missing.
@@ -2397,6 +2965,21 @@ fn doctor() -> bool {
         "set --reports or PHANTOMQA_REPORTS to a folder you can write to",
     );
 
+    let tokens = load_tokens(&config.tokens).and_then(|list| {
+        let active = list.iter().filter(|t| t.expires.is_none_or(|e| now_secs() < e)).count();
+        if active == 0 {
+            Err("none yet".into())
+        } else {
+            Ok(format!("{active} active in {}", config.tokens.display()))
+        }
+    });
+    check(
+        false,
+        "API tokens",
+        tokens,
+        "only `serve` needs them: phantomqa token add NAME",
+    );
+
     let on_off = |on: bool| if on { "on" } else { "off" };
     println!(
         "info  video: {}, screenshots: {}",
@@ -2420,6 +3003,7 @@ commands:
   launch PACKAGE      start an app
   crashes             list crashes and ANRs in the device's crash log
   token ...           API tokens: add, rotate, remove, list, check (see `phantomqa token`)
+  serve [--listen ADDR]  read-only HTTP API over the reports (default 127.0.0.1:7070, env PHANTOMQA_LISTEN)
 
 options (each also has an env var):
   --adb PATH          adb binary            ADB  (default: $ANDROID_HOME/platform-tools/adb, then PATH)
@@ -2461,6 +3045,7 @@ fn main() {
         }
         ["doctor"] => std::process::exit(if doctor() { 0 } else { 1 }),
         ["token", ref rest @ ..] => token_command(rest),
+        ["serve", ref rest @ ..] => serve(rest),
         ["crashes"] => read_crash_log(None).map(|log| {
             let crashes = parse_crashes(&log);
             if crashes.is_empty() {
@@ -2904,7 +3489,7 @@ mod tests {
         let dir = report_dir(&mut state).unwrap();
         finish_session(&mut state);
         let report = fs::read_to_string(dir.join("report.md")).unwrap();
-        assert!(report.ends_with("\n## Video\n\nVideo was off: turned off.\n"));
+        assert!(report.ends_with("\nNo bugs found.\n\n## Video\n\nVideo was off: turned off.\n"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3219,5 +3804,354 @@ mod tests {
         assert_eq!(utc_date(NOW), "2026-11-11 06:06 UTC");
         assert_eq!(utc_date(951_782_400), "2000-02-29 00:00 UTC");
         assert_eq!(utc_date(4_102_444_800), "2100-01-01 00:00 UTC");
+    }
+
+    // ------------------------------------------------------------ HTTP API
+
+    struct Api {
+        dir: PathBuf,
+        reports: PathBuf,
+        tokens: PathBuf,
+        token: String,
+    }
+
+    impl Api {
+        fn new(test: &str) -> Api {
+            let dir = token_dir(&format!("api-{test}"));
+            let tokens = dir.join("tokens.json");
+            let token = token_add(&tokens, "dashboard", None, now_secs()).unwrap();
+            let reports = dir.join("reports");
+            fs::create_dir_all(&reports).unwrap();
+            Api {
+                dir,
+                reports,
+                tokens,
+                token,
+            }
+        }
+
+        fn request(&self, method: &str, url: &str, auth: Option<&str>, range: Option<&str>) -> Reply {
+            let req = ApiRequest {
+                method,
+                url,
+                authorization: auth,
+                range,
+            };
+            route(&req, &self.reports, &self.tokens).0
+        }
+
+        fn get(&self, url: &str) -> Reply {
+            let auth = format!("Bearer {}", self.token);
+            self.request("GET", url, Some(&auth), None)
+        }
+
+        fn run(&self, n: usize, run_json: Option<&str>) -> PathBuf {
+            let dir = self.reports.join(format!("run-{n:03}"));
+            fs::create_dir_all(&dir).unwrap();
+            if let Some(text) = run_json {
+                fs::write(dir.join("run.json"), text).unwrap();
+            }
+            dir
+        }
+    }
+
+    impl Drop for Api {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn body(reply: Reply) -> Vec<u8> {
+        match reply.body {
+            Body::Bytes(bytes) => bytes,
+            Body::File { mut file, start, len } => {
+                use std::io::Seek;
+                file.seek(std::io::SeekFrom::Start(start)).unwrap();
+                let mut out = Vec::new();
+                file.take(len).read_to_end(&mut out).unwrap();
+                out
+            }
+        }
+    }
+
+    fn json_body(reply: Reply) -> Value {
+        serde_json::from_slice(&body(reply)).unwrap()
+    }
+
+    fn header<'a>(reply: &'a Reply, name: &str) -> Option<&'a str> {
+        reply.headers.iter().find(|(k, _)| *k == name).map(|(_, v)| v.as_str())
+    }
+
+    fn run_json(status: &str, bugs: Value) -> String {
+        json!({"version": 1, "run": 0, "status": status, "device": "Pixel, Android 14 (API 34)",
+               "bugs": bugs, "session_video": null})
+        .to_string()
+    }
+
+    #[test]
+    fn api_public_routes_and_request_checks() {
+        let api = Api::new("public");
+        let health = api.request("GET", "/health", None, None);
+        assert_eq!(health.status, 200);
+        assert_eq!(json_body(health)["ok"], true);
+        assert_eq!(api.request("GET", "/health/", None, None).status, 200, "trailing slash");
+        assert_eq!(api.request("HEAD", "/health", None, None).status, 200);
+        let spec = json_body(api.request("GET", "/openapi.json", None, None));
+        assert_eq!(spec["openapi"], "3.1.0");
+
+        assert_eq!(api.request("GET", "/nope", None, None).status, 404);
+        let post = api.request("POST", "/v1/runs", None, None);
+        assert_eq!(post.status, 405);
+        assert_eq!(header(&post, "Allow"), Some("GET, HEAD"));
+        assert_eq!(api.request("DELETE", "/health", None, None).status, 405);
+        let long = format!("/v1/runs?{}", "x".repeat(3000));
+        assert_eq!(api.request("GET", &long, None, None).status, 414);
+    }
+
+    #[test]
+    fn api_needs_a_valid_token_and_hides_routes_without_one() {
+        let api = Api::new("auth");
+        for auth in [
+            None,
+            Some("Bearer nope"),
+            Some("Basic abc"),
+            Some("Bearer pqa_0000000000000000_"),
+        ] {
+            let reply = api.request("GET", "/v1/runs", auth, None);
+            assert_eq!(reply.status, 401, "{auth:?}");
+            assert_eq!(header(&reply, "WWW-Authenticate"), Some("Bearer realm=\"phantomqa\""));
+            assert_eq!(json_body(reply)["error"]["code"], "unauthorized");
+        }
+        assert_eq!(api.request("GET", "/v1/secret-route", None, None).status, 401);
+        assert_eq!(api.get("/v1/runs").status, 200);
+        assert_eq!(api.get("/v1/secret-route").status, 404);
+
+        // Revoked: refused on the very next request.
+        token_remove(&api.tokens, "dashboard", false, now_secs()).unwrap();
+        assert_eq!(api.get("/v1/runs").status, 401);
+    }
+
+    #[test]
+    fn api_lists_runs_newest_first() {
+        let api = Api::new("list");
+        api.run(1, None);
+        api.run(2, Some(&run_json("finished", json!([{"bug": 1}, {"bug": 2}]))));
+        api.run(10, Some(&run_json("finished", json!([]))));
+        // Not runs: a non-canonical name, another folder, and a file.
+        fs::create_dir_all(api.reports.join("run-03")).unwrap();
+        fs::create_dir_all(api.reports.join("notes")).unwrap();
+        fs::write(api.reports.join("run-004"), b"").unwrap();
+
+        let runs = json_body(api.get("/v1/runs"))["runs"].clone();
+        assert_eq!(
+            runs,
+            json!([
+                {"run": 10, "status": "finished", "bugs": 0},
+                {"run": 2, "status": "finished", "bugs": 2},
+                {"run": 1, "status": "unknown", "bugs": 0},
+            ])
+        );
+        let limited = json_body(api.get("/v1/runs?limit=2&other=x"));
+        assert_eq!(limited["runs"].as_array().unwrap().len(), 2);
+        for bad in ["0", "abc", "1001", "-1", ""] {
+            let reply = api.get(&format!("/v1/runs?limit={bad}"));
+            assert_eq!(reply.status, 400, "limit={bad}");
+            assert_eq!(json_body(reply)["error"]["code"], "bad_request");
+        }
+
+        // No reports folder at all: an empty list.
+        fs::remove_dir_all(&api.reports).unwrap();
+        assert_eq!(json_body(api.get("/v1/runs"))["runs"], json!([]));
+    }
+
+    #[test]
+    fn api_run_status_notices_killed_sessions() {
+        let api = Api::new("status");
+        let bug = json!([{"bug": 1, "title": "t", "severity": "high", "app": "a", "files": {"log": "bug-01.log"}}]);
+        let finished = api.run(2, Some(&run_json("finished", bug.clone())));
+        fs::write(finished.join("report.md"), "# report").unwrap();
+        fs::write(finished.join(RUN_LOCK), b"").unwrap();
+        fs::create_dir_all(finished.join("video")).unwrap();
+        fs::write(finished.join("video").join("part-001.mp4"), b"v").unwrap();
+
+        let detail = json_body(api.get("/v1/runs/2"));
+        assert_eq!(detail["status"], "finished");
+        assert_eq!(detail["bugs"], bug);
+        assert_eq!(detail["device"], "Pixel, Android 14 (API 34)");
+        assert_eq!(
+            detail["files"],
+            json!(["report.md", "run.json", "video/part-001.mp4"]),
+            "no hidden files"
+        );
+        assert_eq!(json_body(api.get("/v1/runs/0002"))["run"], 2);
+
+        let running = api.run(3, Some(&run_json("running", json!([]))));
+        let held = fs::File::create(running.join(RUN_LOCK)).unwrap();
+        held.try_lock().unwrap();
+        assert_eq!(json_body(api.get("/v1/runs/3"))["status"], "running");
+        drop(held);
+        assert_eq!(
+            json_body(api.get("/v1/runs/3"))["status"],
+            "interrupted",
+            "session gone, lock free"
+        );
+        api.run(4, Some(&run_json("running", json!([]))));
+        assert_eq!(
+            json_body(api.get("/v1/runs/4"))["status"],
+            "interrupted",
+            "no lock file at all"
+        );
+
+        api.run(5, Some("{not json"));
+        let broken = json_body(api.get("/v1/runs/5"));
+        assert_eq!(broken["status"], "broken");
+        assert!(broken["error"].as_str().unwrap().contains("not valid JSON"));
+        api.run(6, Some(r#"{"version": 9, "bugs": []}"#));
+        assert_eq!(json_body(api.get("/v1/runs/6"))["status"], "broken");
+        api.run(7, None);
+        assert_eq!(json_body(api.get("/v1/runs/7"))["status"], "unknown");
+
+        for missing in [
+            "/v1/runs/9",
+            "/v1/runs/0",
+            "/v1/runs/abc",
+            "/v1/runs/-1",
+            "/v1/runs/9999999999",
+            "/v1/runs/2/x",
+        ] {
+            assert_eq!(api.get(missing).status, 404, "{missing}");
+        }
+    }
+
+    #[test]
+    fn api_serves_only_real_visible_files() {
+        let api = Api::new("files");
+        let dir = api.run(1, Some(&run_json("finished", json!([]))));
+        fs::write(dir.join("report.md"), "# report").unwrap();
+        fs::write(dir.join(RUN_LOCK), b"").unwrap();
+        fs::create_dir_all(dir.join("video")).unwrap();
+        fs::write(dir.join("video").join("part-001.mp4"), b"0123456789").unwrap();
+
+        let report = api.get("/v1/runs/1/files/report.md");
+        assert_eq!(report.status, 200);
+        assert_eq!(header(&report, "Content-Type"), Some("text/markdown; charset=utf-8"));
+        assert_eq!(header(&report, "Accept-Ranges"), Some("bytes"));
+        assert_eq!(body(report), b"# report");
+        assert_eq!(api.get("/v1/runs/1/files/video/part-001.mp4").status, 200);
+        assert_eq!(
+            header(&api.get("/v1/runs/1/files/run.json"), "Content-Type"),
+            Some("application/json; charset=utf-8")
+        );
+
+        for bad in [
+            "/v1/runs/1/files/.lock",
+            "/v1/runs/1/files/..",
+            "/v1/runs/1/files/../run.json",
+            "/v1/runs/1/files/%2e%2e",
+            "/v1/runs/1/files/video",
+            "/v1/runs/1/files/missing.png",
+            "/v1/runs/1/files/video/../report.md",
+            "/v1/runs/1/files/a%2Fb",
+            "/v1/runs/2/files/report.md",
+        ] {
+            assert_eq!(api.get(bad).status, 404, "{bad}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hostname", dir.join("outside.txt")).unwrap();
+            assert_eq!(
+                api.get("/v1/runs/1/files/outside.txt").status,
+                404,
+                "links are not followed"
+            );
+            std::os::unix::fs::symlink(&dir, api.reports.join("run-002")).unwrap();
+            assert_eq!(api.get("/v1/runs/2").status, 404, "a linked run folder is not served");
+        }
+    }
+
+    #[test]
+    fn api_byte_ranges() {
+        use ByteRange::*;
+        let cases = [
+            (None, 10, Whole),
+            (Some("bytes=0-3"), 10, Part(0, 3)),
+            (Some("bytes=5-"), 10, Part(5, 9)),
+            (Some("bytes=-3"), 10, Part(7, 9)),
+            (Some("bytes=-30"), 10, Part(0, 9)),
+            (Some("bytes=8-100"), 10, Part(8, 9)),
+            (Some("bytes=10-"), 10, Unsatisfiable),
+            (Some("bytes=10-20"), 10, Unsatisfiable),
+            (Some("bytes=-0"), 10, Unsatisfiable),
+            (Some("bytes=0-"), 0, Unsatisfiable),
+            (Some("bytes=5-3"), 10, Whole),
+            (Some("bytes=0-1,4-5"), 10, Whole),
+            (Some("items=0-1"), 10, Whole),
+            (Some("bytes=a-b"), 10, Whole),
+            (Some("bytes=-"), 10, Whole),
+            (Some("bytes=+1-2"), 10, Whole),
+        ];
+        for (header, size, expected) in cases {
+            assert_eq!(parse_range(header, size), expected, "{header:?} of {size}");
+        }
+
+        let api = Api::new("ranges");
+        let dir = api.run(1, None);
+        fs::write(dir.join("bug-01.mp4"), b"0123456789").unwrap();
+        let auth = format!("Bearer {}", api.token);
+        let url = "/v1/runs/1/files/bug-01.mp4";
+        let part = api.request("GET", url, Some(&auth), Some("bytes=2-4"));
+        assert_eq!(part.status, 206);
+        assert_eq!(header(&part, "Content-Range"), Some("bytes 2-4/10"));
+        assert_eq!(header(&part, "Content-Type"), Some("video/mp4"));
+        assert_eq!(body(part), b"234");
+        let tail = api.request("GET", url, Some(&auth), Some("bytes=-2"));
+        assert_eq!(body(tail), b"89");
+        let outside = api.request("GET", url, Some(&auth), Some("bytes=50-"));
+        assert_eq!(outside.status, 416);
+        assert_eq!(header(&outside, "Content-Range"), Some("bytes */10"));
+    }
+
+    #[test]
+    fn openapi_lists_exactly_the_routes() {
+        let spec: Value = serde_json::from_str(OPENAPI).unwrap();
+        let mut documented: Vec<&str> = spec["paths"].as_object().unwrap().keys().map(String::as_str).collect();
+        let mut routes = ROUTES.to_vec();
+        documented.sort();
+        routes.sort();
+        assert_eq!(documented, routes);
+        for (path, item) in spec["paths"].as_object().unwrap() {
+            assert!(item["get"]["responses"]["200"].is_object(), "{path} documents its 200");
+        }
+    }
+
+    #[test]
+    fn mcp_session_writes_run_json_for_the_api() {
+        let api = Api::new("session");
+        let mut state = State::new(api.reports.clone());
+        state.video_checked = true;
+        report_dir(&mut state).unwrap();
+        assert_eq!(
+            json_body(api.get("/v1/runs/1"))["status"],
+            "running",
+            "the session holds the lock"
+        );
+
+        let bug = Bug {
+            title: "Login fails".into(),
+            severity: "high".into(),
+            package: "com.x".into(),
+            body: "b".into(),
+        };
+        save_bug(&mut state, &bug, "").unwrap();
+        let detail = json_body(api.get("/v1/runs/1"));
+        assert_eq!(detail["bugs"][0]["title"], "Login fails");
+        assert_eq!(detail["bugs"][0]["severity"], "high");
+        assert_eq!(detail["bugs"][0]["files"]["log"], "bug-01.log");
+
+        finish_session(&mut state);
+        let detail = json_body(api.get("/v1/runs/1"));
+        assert_eq!(detail["status"], "finished");
+        assert_eq!(detail["session_video"], Value::Null);
+        assert_eq!(json_body(api.get("/v1/runs"))["runs"][0]["bugs"], 1);
     }
 }
