@@ -2,7 +2,7 @@
 
 AI agents test Android apps on an emulator and report what breaks.
 
-Step 1 (this version): one Rust binary that lets an agent see and use the emulator, through MCP or by hand. Everything goes through `adb`.
+One Rust binary lets an agent see and use the emulator, find crashes and write a bug report. It works through MCP or by hand. Everything goes through `adb`.
 
 ## Build
 
@@ -18,6 +18,7 @@ phantomqa screen                        # print the current screen
 phantomqa tap 3                         # tap element [3]
 phantomqa type 2 hello world            # tap element [2] and type text
 phantomqa back                          # press back
+phantomqa crashes                       # list crashes and ANRs in the device's crash log
 ```
 
 The screen is a short numbered list, for example:
@@ -39,12 +40,28 @@ claude mcp add phantomqa -e ANDROID_HOME=$ANDROID_HOME -- $PWD/target/release/ph
 
 Then ask Claude Code something like: "Open com.android.settings, turn on dark mode and tell me what you see."
 
-Tools: `screen`, `tap`, `type_text`, `back`, `launch_app`.
+Tools: `screen`, `tap`, `type_text`, `back`, `launch_app`, `crashes`, `report_bug`.
+
+## Crashes and bug reports
+
+- After every action, PhantomQA reads the device's crash log. A new crash, native crash or ANR is shown to the agent and saved to the report automatically.
+- The agent calls `report_bug` (title, steps, expected, actual, severity) for problems it finds.
+- Each bug gets a screenshot and the app's log. The report also lists the recent actions, so a person can follow the same path.
+
+Reports go to `reports/<start time>/`:
+
+```
+reports/2026-11-11_10-12-31/
+  report.md      one section per bug
+  bug-01.png     screenshot
+  bug-01.log     crash lines and the app's recent log
+```
 
 ## Settings
 
 - `ANDROID_SERIAL`: which device to use when more than one is connected.
 - `ADB`: path to the adb binary. Otherwise `$ANDROID_HOME/platform-tools/adb`, then `adb` on PATH.
+- `PHANTOMQA_REPORTS`: folder for reports. Default: `reports`.
 
 ## Limits for now
 

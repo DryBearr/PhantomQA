@@ -7,3 +7,6 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Test reports (screenshots and logs)
+/reports/

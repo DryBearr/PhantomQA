@@ -1,16 +1,19 @@
-//! PhantomQA, step 1: let an AI agent see and use an Android emulator.
+//! PhantomQA: an AI agent tests an Android app on an emulator and reports bugs.
 //!
 //! `phantomqa mcp` runs an MCP server over stdio (for Claude Code and other agents).
-//! `phantomqa screen | tap N | type N TEXT | back | launch PACKAGE` does the same by hand.
+//! `phantomqa screen | tap N | type N TEXT | back | launch PACKAGE | crashes` does the same by hand.
 //!
 //! Everything goes through `adb`. Set ANDROID_SERIAL when more than one device is connected.
+//! Bug reports go to ./reports/<start time>/ (change the root with PHANTOMQA_REPORTS).
 
 use serde_json::{Value, json};
+use std::fs;
 use std::io::{BufRead, Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long to wait after an action before reading the screen again.
 const SETTLE: Duration = Duration::from_millis(500);
@@ -18,6 +21,11 @@ const SETTLE: Duration = Duration::from_millis(500);
 const ADB_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longer labels are cut, to keep the screen list small.
 const MAX_LABEL: usize = 80;
+/// Log lines kept per crash.
+const MAX_CRASH_LINES: usize = 40;
+/// Recent actions kept for the "how did we get here" part of a bug.
+const MAX_HISTORY: usize = 15;
+const SEVERITIES: [&str; 4] = ["critical", "high", "medium", "low"];
 
 /// One thing on the screen the agent can refer to by number.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,10 +37,47 @@ struct Element {
     center: (i32, i32),
 }
 
-/// The elements from the last screen read. Numbers in `tap N` index into this list.
-#[derive(Default)]
+/// Everything the server remembers between tool calls.
 struct State {
+    /// Elements from the last screen read. Numbers in `tap N` index into this list.
     elements: Vec<Element>,
+    /// App package of the last screen read.
+    package: String,
+    /// Recent actions, newest last.
+    history: Vec<String>,
+    /// Logcat time ("sssss.mmm") to read crashes from. None until the first check.
+    crash_since: Option<String>,
+    report_root: PathBuf,
+    /// When this run started, for the report header.
+    started: String,
+    /// Created on the first bug.
+    report: Option<Report>,
+}
+
+struct Report {
+    dir: PathBuf,
+    bugs: usize,
+}
+
+impl State {
+    fn new(report_root: PathBuf) -> Self {
+        State {
+            elements: Vec::new(),
+            package: String::new(),
+            history: Vec::new(),
+            crash_since: None,
+            report_root,
+            started: host_time("%Y-%m-%d %H:%M:%S"),
+            report: None,
+        }
+    }
+
+    fn remember(&mut self, action: String) {
+        self.history.push(action);
+        if self.history.len() > MAX_HISTORY {
+            self.history.remove(0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- adb
@@ -52,8 +97,13 @@ fn adb_path() -> String {
     "adb".into()
 }
 
-/// Runs adb with a timeout and returns its stdout.
+/// Runs adb with a timeout and returns its stdout as text.
 fn adb(args: &[&str]) -> Result<String, String> {
+    adb_bytes(args).map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Runs adb with a timeout and returns its raw stdout.
+fn adb_bytes(args: &[&str]) -> Result<Vec<u8>, String> {
     let mut child = Command::new(adb_path())
         .args(args)
         .stdin(Stdio::null())
@@ -90,13 +140,30 @@ fn adb(args: &[&str]) -> Result<String, String> {
         }
     };
 
-    let stdout = String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned();
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
     if !status.success() {
-        let detail = format!("{} {}", stderr.trim(), stdout.trim());
+        let detail = format!(
+            "{} {}",
+            String::from_utf8_lossy(&stderr).trim(),
+            String::from_utf8_lossy(&stdout).trim()
+        );
         return Err(format!("adb {} failed: {}", args.join(" "), detail.trim()));
     }
     Ok(stdout)
+}
+
+fn valid_package(package: &str) -> bool {
+    !package.is_empty() && package.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+}
+
+fn screenshot() -> Result<Vec<u8>, String> {
+    let png = adb_bytes(&["exec-out", "screencap", "-p"])?;
+    if png.starts_with(b"\x89PNG") {
+        Ok(png)
+    } else {
+        Err("screencap did not return a PNG".into())
+    }
 }
 
 /// Quotes one argument for the device shell (adb joins shell arguments with spaces).
@@ -398,7 +465,17 @@ fn read_screen(state: &mut State) -> Result<String, String> {
     let (package, elements) = parse_screen(&xml);
     let text = render_screen(&package, &elements);
     state.elements = elements;
+    state.package = package;
     Ok(text)
+}
+
+/// Short description of an element for the action history, e.g. `[3] Button "Log in"`.
+fn describe(id: i64, e: &Element) -> String {
+    if e.label.is_empty() {
+        format!("[{id}] {}", e.kind)
+    } else {
+        format!("[{id}] {} {:?}", e.kind, e.label)
+    }
 }
 
 fn element(state: &State, id: i64) -> Result<Element, String> {
@@ -412,6 +489,7 @@ fn element(state: &State, id: i64) -> Result<Element, String> {
 
 fn tap(state: &mut State, id: i64) -> Result<String, String> {
     let e = element(state, id)?;
+    state.remember(format!("tap {}", describe(id, &e)));
     let (x, y) = e.center;
     adb(&["shell", "input", "tap", &x.to_string(), &y.to_string()])?;
     sleep(SETTLE);
@@ -432,6 +510,7 @@ fn input_text_arg(text: &str) -> Result<String, String> {
 fn type_text(state: &mut State, id: i64, text: &str) -> Result<String, String> {
     let arg = input_text_arg(text)?;
     let e = element(state, id)?;
+    state.remember(format!("type_text {}: {text:?}", describe(id, &e)));
     let (x, y) = e.center;
     adb(&["shell", "input", "tap", &x.to_string(), &y.to_string()])?;
     sleep(Duration::from_millis(300));
@@ -441,16 +520,17 @@ fn type_text(state: &mut State, id: i64, text: &str) -> Result<String, String> {
 }
 
 fn back(state: &mut State) -> Result<String, String> {
+    state.remember("back".into());
     adb(&["shell", "input", "keyevent", "KEYCODE_BACK"])?;
     sleep(SETTLE);
     read_screen(state)
 }
 
 fn launch_app(state: &mut State, package: &str) -> Result<String, String> {
-    let valid = !package.is_empty() && package.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_');
-    if !valid {
+    if !valid_package(package) {
         return Err(format!("not a valid package name: {package:?}"));
     }
+    state.remember(format!("launch_app {package}"));
     let resolved = adb(&[
         "shell",
         "cmd",
@@ -475,7 +555,396 @@ fn launch_app(state: &mut State, package: &str) -> Result<String, String> {
     read_screen(state)
 }
 
+// ---------------------------------------------------------------- crashes
+
+/// A Java crash, native crash or ANR found in logcat.
+#[derive(Debug, PartialEq)]
+struct Crash {
+    kind: &'static str,
+    process: String,
+    summary: String,
+    lines: Vec<String>,
+}
+
+impl Crash {
+    fn title(&self) -> String {
+        let kind = match self.kind {
+            "crash" => "Crash",
+            "native crash" => "Native crash",
+            other => other,
+        };
+        format!("{kind} in {}: {}", self.process, self.summary)
+    }
+}
+
+struct LogLine<'a> {
+    time: &'a str,
+    pid: &'a str,
+    tag: &'a str,
+    msg: &'a str,
+}
+
+/// Parses one `logcat -v threadtime -v epoch` line: "TIME PID TID LEVEL TAG: MESSAGE".
+fn parse_log_line(line: &str) -> Option<LogLine<'_>> {
+    let mut rest = line.trim_start();
+    let mut fields = [""; 4];
+    for field in &mut fields {
+        let end = rest.find(char::is_whitespace)?;
+        *field = &rest[..end];
+        rest = rest[end..].trim_start();
+    }
+    let colon = rest.find(':')?;
+    let msg = &rest[colon + 1..];
+    Some(LogLine {
+        time: fields[0],
+        pid: fields[1],
+        tag: rest[..colon].trim(),
+        msg: msg.strip_prefix(' ').unwrap_or(msg).trim_end(),
+    })
+}
+
+/// The text inside the last "(...)" of a line.
+fn last_parens(s: &str) -> Option<&str> {
+    let open = s.rfind('(')?;
+    let close = s[open..].find(')')? + open;
+    Some(&s[open + 1..close])
+}
+
+/// Groups crash and ANR lines from logcat into crashes.
+fn parse_crashes(log: &str) -> Vec<Crash> {
+    let mut crashes: Vec<Crash> = Vec::new();
+    // Tag and pid of the line that started the last crash; its next lines share them.
+    let mut current: Option<(String, String)> = None;
+
+    for line in log.lines() {
+        let Some(l) = parse_log_line(line) else { continue };
+        let start = match l.tag {
+            "AndroidRuntime" if l.msg.starts_with("FATAL EXCEPTION") => Some(("crash", String::new())),
+            "ActivityManager" if l.msg.starts_with("ANR in ") => {
+                let process = l.msg["ANR in ".len()..].split_whitespace().next().unwrap_or("");
+                Some(("ANR", process.to_string()))
+            }
+            "libc" if l.msg.starts_with("Fatal signal") => {
+                Some(("native crash", last_parens(l.msg).unwrap_or("").to_string()))
+            }
+            _ => None,
+        };
+        if let Some((kind, process)) = start {
+            let summary = if kind == "crash" { String::new() } else { l.msg.to_string() };
+            crashes.push(Crash { kind, process, summary, lines: vec![l.msg.to_string()] });
+            current = Some((l.tag.to_string(), l.pid.to_string()));
+            continue;
+        }
+
+        let Some(crash) = crashes.last_mut() else { continue };
+        let Some((tag, pid)) = &current else { continue };
+        // Native crash details come from the DEBUG tag, in another process (crash_dump).
+        let belongs = (l.tag == tag && l.pid == pid) || (l.tag == "DEBUG" && crash.kind == "native crash");
+        if !belongs || crash.lines.len() >= MAX_CRASH_LINES {
+            continue;
+        }
+        crash.lines.push(l.msg.to_string());
+
+        match crash.kind {
+            "crash" => {
+                if let Some(rest) = l.msg.strip_prefix("Process: ") {
+                    crash.process = rest.split(',').next().unwrap_or("").trim().to_string();
+                } else if crash.summary.is_empty() && !l.msg.starts_with('\t') && !l.msg.starts_with("at ") {
+                    crash.summary = l.msg.to_string();
+                }
+            }
+            "ANR" => {
+                if let Some(reason) = l.msg.strip_prefix("Reason: ") {
+                    crash.summary = reason.to_string();
+                }
+            }
+            _ => {
+                if let Some(start) = l.msg.find(">>> ")
+                    && let Some(len) = l.msg[start + 4..].find(" <<<")
+                {
+                    crash.process = l.msg[start + 4..start + 4 + len].to_string();
+                }
+            }
+        }
+    }
+    crashes
+}
+
+/// Device time as a logcat time ("sssss.mmm").
+fn device_now() -> Result<String, String> {
+    let out = adb(&["shell", "date", "+%s"])?;
+    let secs = out.trim();
+    if secs.is_empty() || !secs.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("unexpected device time: {secs:?}"));
+    }
+    Ok(format!("{secs}.000"))
+}
+
+/// One millisecond after a logcat time, so the next read starts after it.
+fn after(time: &str) -> Option<String> {
+    let t: f64 = time.parse().ok()?;
+    Some(format!("{:.3}", t + 0.001))
+}
+
+/// Reads crash and ANR lines from logcat: since a logcat time, or the whole buffer.
+fn read_crash_log(since: Option<&str>) -> Result<String, String> {
+    let mut cmd = String::from("logcat -d -v threadtime -v epoch -b crash -b system");
+    if let Some(since) = since {
+        cmd.push_str(&format!(" -T {}", shell_quote(since)));
+    }
+    cmd.push_str(" AndroidRuntime:E ActivityManager:E DEBUG:F libc:F '*:S'");
+    adb(&["exec-out", &cmd])
+}
+
+/// Crashes since the last check. The first check only sets the start time.
+fn new_crashes(state: &mut State) -> Result<Vec<Crash>, String> {
+    let Some(since) = state.crash_since.clone() else {
+        state.crash_since = Some(device_now()?);
+        return Ok(Vec::new());
+    };
+    let log = read_crash_log(Some(&since))?;
+    if let Some(next) = log.lines().rev().find_map(parse_log_line).and_then(|l| after(l.time)) {
+        state.crash_since = Some(next);
+    }
+    Ok(parse_crashes(&log))
+}
+
+fn render_crash(crash: &Crash) -> String {
+    let mut out = format!("!! {}\n", crash.title());
+    // The first line, the process line and the summary are already in the title.
+    let details = crash
+        .lines
+        .iter()
+        .skip(1)
+        .filter(|l| !l.starts_with("Process: ") && **l != crash.summary);
+    for line in details.take(5) {
+        out.push_str(&format!("   {}\n", line.trim()));
+    }
+    out
+}
+
+/// Checks for new crashes, saves each to the report, and returns a notice for the agent ("" if none).
+fn crash_notice(state: &mut State) -> String {
+    let crashes = match new_crashes(state) {
+        Ok(crashes) => crashes,
+        Err(e) => return format!("\n(could not check for crashes: {e})\n"),
+    };
+    let mut out = String::new();
+    for crash in &crashes {
+        out.push('\n');
+        out.push_str(&render_crash(crash));
+        match save_crash(state, crash) {
+            Ok(n) => out.push_str(&format!("   Saved to the report as bug {n}. Do not report it again.\n")),
+            Err(e) => out.push_str(&format!("   Could not save it to the report: {e}\n")),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------- report
+
+/// Local time from the host `date` command, or epoch seconds if that fails.
+fn host_time(format: &str) -> String {
+    Command::new("date")
+        .arg(format!("+{format}"))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            secs.to_string()
+        })
+}
+
+fn device_name() -> String {
+    match adb(&["shell", "getprop ro.product.model; getprop ro.build.version.release"]) {
+        Ok(out) => {
+            let mut lines = out.lines().map(str::trim);
+            let model = lines.next().unwrap_or("?");
+            let version = lines.next().unwrap_or("?");
+            format!("{model}, Android {version}")
+        }
+        Err(_) => "unknown".into(),
+    }
+}
+
+/// The report folder. Creates it with report.md on the first bug.
+fn report_dir(state: &mut State) -> Result<PathBuf, String> {
+    if let Some(report) = &state.report {
+        return Ok(report.dir.clone());
+    }
+    let root = &state.report_root;
+    fs::create_dir_all(root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
+    // "2026-11-11 10:11:19" -> "2026-11-11_10-11-19"
+    let stamp = state.started.replace(' ', "_").replace(':', "-");
+    let mut dir = root.join(&stamp);
+    let mut n = 1;
+    loop {
+        match fs::create_dir(&dir) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                n += 1;
+                dir = root.join(format!("{stamp}-{n}"));
+            }
+            Err(e) => return Err(format!("cannot create {}: {e}", dir.display())),
+        }
+    }
+    let header = format!("# PhantomQA test report\n\n- Started: {}\n- Device: {}\n", state.started, device_name());
+    fs::write(dir.join("report.md"), header).map_err(|e| format!("cannot write report.md: {e}"))?;
+    state.report = Some(Report { dir: dir.clone(), bugs: 0 });
+    Ok(dir)
+}
+
+/// The app's recent log, or recent warnings and errors when the app is not running.
+fn app_log(package: &str) -> String {
+    let pid = if valid_package(package) {
+        adb(&["shell", "pidof", package])
+            .ok()
+            .and_then(|out| out.split_whitespace().next().map(str::to_string))
+            .filter(|pid| pid.chars().all(|c| c.is_ascii_digit()))
+    } else {
+        None
+    };
+    let cmd = match &pid {
+        Some(pid) => format!("logcat -d -v threadtime -t 300 --pid={pid}"),
+        None => "logcat -d -v threadtime -t 300 '*:W'".to_string(),
+    };
+    adb(&["exec-out", &cmd]).unwrap_or_else(|e| format!("(could not read the log: {e})\n"))
+}
+
+struct Bug {
+    title: String,
+    severity: String,
+    package: String,
+    /// Markdown with the details: steps, expected, actual, or crash lines.
+    body: String,
+}
+
+fn render_bug(n: usize, bug: &Bug, time: &str, history: &[String], attachments: &str) -> String {
+    let mut out = format!("\n## Bug {n}: {}\n\n", bug.title);
+    out.push_str(&format!("- Severity: {}\n", bug.severity));
+    if !bug.package.is_empty() {
+        out.push_str(&format!("- App: {}\n", bug.package));
+    }
+    out.push_str(&format!("- Time: {time}\n\n{}\n", bug.body.trim_end()));
+    if !history.is_empty() {
+        out.push_str("\n**Recent actions** (newest last)\n\n");
+        for action in history {
+            out.push_str(&format!("- {action}\n"));
+        }
+    }
+    out.push_str(&format!("\n{attachments}\n"));
+    out
+}
+
+/// Saves one bug: a section in report.md, a screenshot and the log. Returns the bug number.
+fn save_bug(state: &mut State, bug: &Bug, extra_log: &str) -> Result<usize, String> {
+    let dir = report_dir(state)?;
+    let n = state.report.as_ref().map_or(0, |r| r.bugs) + 1;
+    let name = format!("bug-{n:02}");
+
+    let shot = match screenshot().and_then(|png| {
+        fs::write(dir.join(format!("{name}.png")), png).map_err(|e| e.to_string())
+    }) {
+        Ok(()) => format!("![screenshot]({name}.png)"),
+        Err(e) => format!("(no screenshot: {e})"),
+    };
+    let log = format!("{extra_log}{}", app_log(&bug.package));
+    let log_link = match fs::write(dir.join(format!("{name}.log")), log) {
+        Ok(()) => format!("Log: [{name}.log]({name}.log)"),
+        Err(e) => format!("(no log: {e})"),
+    };
+
+    let section = render_bug(n, bug, &host_time("%H:%M:%S"), &state.history, &format!("{shot}\n\n{log_link}"));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("report.md"))
+        .and_then(|mut file| file.write_all(section.as_bytes()))
+        .map_err(|e| format!("cannot write report.md: {e}"))?;
+    if let Some(report) = &mut state.report {
+        report.bugs = n;
+    }
+    Ok(n)
+}
+
+fn save_crash(state: &mut State, crash: &Crash) -> Result<usize, String> {
+    let lines = crash.lines.join("\n");
+    let bug = Bug {
+        title: crash.title(),
+        severity: "critical".into(),
+        package: crash.process.split(':').next().unwrap_or("").to_string(),
+        body: format!("Found automatically in logcat.\n\n```\n{lines}\n```\n"),
+    };
+    save_bug(state, &bug, &format!("--- {} ---\n{lines}\n\n--- recent log ---\n", crash.kind))
+}
+
+/// "1. Open the app" -> "Open the app"
+fn strip_step_number(step: &str) -> &str {
+    let digits = step.len() - step.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let rest = &step[digits..];
+    match rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')) {
+        Some(after) if digits > 0 && after.starts_with(' ') => after.trim_start(),
+        _ => step,
+    }
+}
+
+/// Checks the report_bug arguments and turns them into a bug.
+fn bug_from_args(args: &Value, package: &str) -> Result<Bug, String> {
+    let text = |key: &str| {
+        args[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("{key:?} is required"))
+    };
+    let title = text("title")?;
+    let expected = text("expected")?;
+    let actual = text("actual")?;
+
+    let raw_steps: Vec<&str> = match &args["steps"] {
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        Value::String(s) => s.lines().collect(),
+        _ => Vec::new(),
+    };
+    let steps: Vec<&str> = raw_steps
+        .into_iter()
+        .map(|s| strip_step_number(s.trim()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if steps.is_empty() {
+        return Err("\"steps\" is required: the steps to reproduce, in order".into());
+    }
+
+    let severity = match args["severity"].as_str().map(|s| s.trim().to_lowercase()) {
+        None => "medium".to_string(),
+        Some(s) if SEVERITIES.contains(&s.as_str()) => s,
+        Some(s) => return Err(format!("severity must be one of {}, not {s:?}", SEVERITIES.join(", "))),
+    };
+
+    let mut body = String::from("**Steps**\n\n");
+    for (i, step) in steps.iter().enumerate() {
+        body.push_str(&format!("{}. {step}\n", i + 1));
+    }
+    body.push_str(&format!("\n**Expected:** {expected}\n\n**Actual:** {actual}\n"));
+    Ok(Bug { title, severity, package: package.to_string(), body })
+}
+
+fn report_bug(state: &mut State, args: &Value) -> Result<String, String> {
+    let bug = bug_from_args(args, &state.package)?;
+    let n = save_bug(state, &bug, "")?;
+    let path = state.report.as_ref().map(|r| r.dir.join("report.md")).unwrap_or_default();
+    Ok(format!("Saved bug {n} to {}, with a screenshot and the app log.", path.display()))
+}
+
 // ---------------------------------------------------------------- MCP server
+
+const INSTRUCTIONS: &str = "PhantomQA lets you test an Android app on an emulator like a real user. \
+Start with launch_app, read the numbered screen list, and use tap, type_text and back. \
+Try the main features, wrong inputs and edge cases. Call report_bug for each problem while it is on screen, \
+with clear steps to reproduce. Crashes and ANRs are found and saved automatically.";
 
 fn tool_list() -> Value {
     let no_args = json!({"type": "object", "properties": {}});
@@ -520,6 +989,26 @@ fn tool_list() -> Value {
                 "required": ["package"],
             },
         },
+        {
+            "name": "crashes",
+            "description": "Check for app crashes and ANRs since the last check. Every action already does this and saves crashes to the report; use it after waiting on a screen.",
+            "inputSchema": no_args,
+        },
+        {
+            "name": "report_bug",
+            "description": "Save a bug to the test report. A screenshot of the current screen and the app log are attached automatically, so call this while the bug is on screen. Crashes are saved automatically; do not report them again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short summary, e.g. \"Login button does nothing after a wrong password\""},
+                    "steps": {"type": "array", "items": {"type": "string"}, "description": "Steps to reproduce, in order"},
+                    "expected": {"type": "string", "description": "What should happen"},
+                    "actual": {"type": "string", "description": "What happens instead"},
+                    "severity": {"type": "string", "enum": SEVERITIES, "description": "Default: medium"},
+                },
+                "required": ["title", "steps", "expected", "actual"],
+            },
+        },
     ])
 }
 
@@ -530,18 +1019,32 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
     let text = |key: &str| {
         args[key].as_str().map(str::to_string).ok_or_else(|| format!("argument {key:?} must be a string"))
     };
+    // Start the crash clock before the first action, so a crash it causes is not missed.
+    if state.crash_since.is_none() {
+        state.crash_since = device_now().ok();
+    }
     let result = match name {
         "screen" => read_screen(state),
         "tap" => int("id").and_then(|id| tap(state, id)),
         "type_text" => int("id").and_then(|id| text("text").and_then(|t| type_text(state, id, &t))),
         "back" => back(state),
         "launch_app" => text("package").and_then(|p| launch_app(state, &p)),
+        "crashes" => Ok(String::new()),
+        "report_bug" => report_bug(state, args),
         _ => Err(format!("unknown tool: {name}")),
     };
-    match result {
-        Ok(text) => json!({"content": [{"type": "text", "text": text}]}),
-        Err(error) => json!({"content": [{"type": "text", "text": error}], "isError": true}),
+    let checks_crashes = matches!(name, "screen" | "tap" | "type_text" | "back" | "launch_app" | "crashes");
+    let notice = if checks_crashes { crash_notice(state) } else { String::new() };
+
+    let (mut text, is_error) = match result {
+        Ok(text) => (text, false),
+        Err(error) => (error, true),
+    };
+    if name == "crashes" && notice.is_empty() {
+        text = "No new crashes or ANRs.".into();
     }
+    text.push_str(&notice);
+    json!({"content": [{"type": "text", "text": text.trim_start()}], "isError": is_error})
 }
 
 /// Handles one JSON-RPC message. Returns the reply, or None for notifications.
@@ -553,6 +1056,7 @@ fn handle_message(state: &mut State, msg: &Value) -> Option<Value> {
             "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "phantomqa", "version": env!("CARGO_PKG_VERSION")},
+            "instructions": INSTRUCTIONS,
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tool_list()})),
@@ -566,8 +1070,7 @@ fn handle_message(state: &mut State, msg: &Value) -> Option<Value> {
 }
 
 /// MCP over stdio: one JSON message per line. Only replies go to stdout; logs go to stderr.
-fn serve_mcp() {
-    let mut state = State::default();
+fn serve_mcp(mut state: State) {
     let mut stdout = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -598,19 +1101,29 @@ const USAGE: &str = "usage:
   phantomqa tap N               tap element N
   phantomqa type N TEXT         tap element N and type TEXT
   phantomqa back                press back
-  phantomqa launch PACKAGE      start an app";
+  phantomqa launch PACKAGE      start an app
+  phantomqa crashes             list crashes and ANRs in the device's crash log";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut state = State::default();
+    let report_root = std::env::var_os("PHANTOMQA_REPORTS").map_or_else(|| PathBuf::from("reports"), PathBuf::from);
+    let mut state = State::new(report_root);
     let id = |s: &str| s.parse::<i64>().map_err(|_| format!("not a number: {s}"));
 
     let result = match args[..] {
         ["mcp"] => {
-            serve_mcp();
+            serve_mcp(state);
             return;
         }
+        ["crashes"] => read_crash_log(None).map(|log| {
+            let crashes = parse_crashes(&log);
+            if crashes.is_empty() {
+                "No crashes or ANRs in the crash log.\n".to_string()
+            } else {
+                crashes.iter().map(render_crash).collect::<Vec<_>>().join("\n")
+            }
+        }),
         ["screen"] => read_screen(&mut state),
         ["tap", n] => id(n).and_then(|n| read_screen(&mut state).and_then(|_| tap(&mut state, n))),
         ["type", n, ref text @ ..] if !text.is_empty() => {
@@ -652,6 +1165,10 @@ mod tests {
   <node index="5" text="Footer" resource-id="" class="android.widget.TextView" package="com.example.app" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,2300][1080,2400]" />
 </node>
 </hierarchy>"#;
+
+    fn test_state() -> State {
+        State::new(std::env::temp_dir().join("phantomqa-test-unused"))
+    }
 
     #[test]
     fn parses_sample_screen() {
@@ -712,7 +1229,8 @@ mod tests {
 
     #[test]
     fn rejects_unknown_element_numbers() {
-        let state = State { elements: parse_screen(SAMPLE).1 };
+        let mut state = test_state();
+        state.elements = parse_screen(SAMPLE).1;
         assert!(element(&state, 1).is_ok());
         assert!(element(&state, 0).is_err());
         assert!(element(&state, 6).is_err());
@@ -721,7 +1239,7 @@ mod tests {
 
     #[test]
     fn mcp_handshake_and_errors() {
-        let mut state = State::default();
+        let mut state = test_state();
         let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}});
         let reply = handle_message(&mut state, &init).unwrap();
         assert_eq!(reply["result"]["protocolVersion"], "2025-06-18");
@@ -732,7 +1250,7 @@ mod tests {
 
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let tools = handle_message(&mut state, &list).unwrap();
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
 
         let bad_tap = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "tap", "arguments": {"id": "x"}}});
         let reply = handle_message(&mut state, &bad_tap).unwrap();
@@ -740,5 +1258,136 @@ mod tests {
 
         let unknown = json!({"jsonrpc": "2.0", "id": 4, "method": "nope"});
         assert_eq!(handle_message(&mut state, &unknown).unwrap()["error"]["code"], -32601);
+    }
+
+    // Real lines from `am crash com.android.settings` on an API 34 emulator, plus noise.
+    const CRASH_LOG: &str = "--------- beginning of crash
+         1794377174.406  6199  6199 E AndroidRuntime: FATAL EXCEPTION: main
+         1794377174.406  6199  6199 E AndroidRuntime: Process: com.android.settings, PID: 6199
+         1794377174.406  6199  6199 E AndroidRuntime: android.app.RemoteServiceException$CrashedByAdbException: shell-induced crash
+         1794377174.406  6199  6199 E AndroidRuntime: \tat android.app.ActivityThread.throwRemoteServiceException(ActivityThread.java:2090)
+         1794377174.410  7000  7000 E AndroidRuntime: some other process
+--------- beginning of system
+         1794377180.100   500   600 E ActivityManager: ANR in com.example.app (com.example.app/.MainActivity)
+         1794377180.100   500   600 E ActivityManager: PID: 4321
+         1794377180.100   500   600 E ActivityManager: Reason: Input dispatching timed out
+         1794377190.000  4400  4400 F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0 in tid 4400 (RenderThread), pid 4400 (com.example.game)
+         1794377190.050  4500  4500 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***
+         1794377190.050  4500  4500 F DEBUG   : pid: 4400, tid: 4400, name: RenderThread  >>> com.example.game <<<
+";
+
+    #[test]
+    fn parses_crashes_anrs_and_native_crashes() {
+        let crashes = parse_crashes(CRASH_LOG);
+        assert_eq!(crashes.len(), 3);
+
+        assert_eq!(crashes[0].kind, "crash");
+        assert_eq!(crashes[0].process, "com.android.settings");
+        assert_eq!(
+            crashes[0].summary,
+            "android.app.RemoteServiceException$CrashedByAdbException: shell-induced crash"
+        );
+        assert_eq!(crashes[0].lines.len(), 4, "the other process's line is not part of this crash");
+        assert!(crashes[0].lines[3].starts_with("\tat android.app"));
+
+        assert_eq!(crashes[1].kind, "ANR");
+        assert_eq!(crashes[1].process, "com.example.app");
+        assert_eq!(crashes[1].summary, "Input dispatching timed out");
+
+        assert_eq!(crashes[2].kind, "native crash");
+        assert_eq!(crashes[2].process, "com.example.game");
+        assert_eq!(crashes[2].lines.len(), 3);
+        assert_eq!(crashes[2].title(), format!("Native crash in com.example.game: {}", crashes[2].lines[0]));
+
+        assert!(parse_crashes("--------- beginning of crash\n").is_empty());
+
+        let notice = render_crash(&crashes[0]);
+        assert_eq!(
+            notice,
+            "!! Crash in com.android.settings: android.app.RemoteServiceException$CrashedByAdbException: shell-induced crash\n   \
+             at android.app.ActivityThread.throwRemoteServiceException(ActivityThread.java:2090)\n"
+        );
+    }
+
+    #[test]
+    fn moves_crash_clock_past_last_line() {
+        assert_eq!(after("1794377174.406").as_deref(), Some("1794377174.407"));
+        assert_eq!(after("1794377174.999").as_deref(), Some("1794377175.000"));
+        assert_eq!(after("nope"), None);
+        let last = CRASH_LOG.lines().rev().find_map(parse_log_line).unwrap();
+        assert_eq!((last.time, last.pid, last.tag), ("1794377190.050", "4500", "DEBUG"));
+    }
+
+    #[test]
+    fn checks_bug_arguments() {
+        let args = json!({
+            "title": "Login does nothing",
+            "steps": ["1. Open the app", "Tap \"Log in\"", "  "],
+            "expected": "An error message",
+            "actual": "Nothing happens",
+        });
+        let bug = bug_from_args(&args, "com.example.app").unwrap();
+        assert_eq!(bug.severity, "medium");
+        assert_eq!(
+            bug.body,
+            "**Steps**\n\n1. Open the app\n2. Tap \"Log in\"\n\n**Expected:** An error message\n\n**Actual:** Nothing happens\n"
+        );
+
+        let as_text = json!({"title": "t", "steps": "1) First\n2) Second", "expected": "e", "actual": "a", "severity": "HIGH"});
+        let bug = bug_from_args(&as_text, "").unwrap();
+        assert_eq!(bug.severity, "high");
+        assert!(bug.body.contains("1. First\n2. Second\n"));
+
+        let missing_steps = json!({"title": "t", "steps": [], "expected": "e", "actual": "a"});
+        assert!(bug_from_args(&missing_steps, "").is_err());
+        let bad_severity = json!({"title": "t", "steps": ["s"], "expected": "e", "actual": "a", "severity": "huge"});
+        assert!(bug_from_args(&bad_severity, "").is_err());
+        let no_title = json!({"steps": ["s"], "expected": "e", "actual": "a"});
+        assert!(bug_from_args(&no_title, "").is_err());
+
+        assert_eq!(strip_step_number("3 dots menu opens"), "3 dots menu opens");
+        assert_eq!(strip_step_number("12. Done"), "Done");
+    }
+
+    #[test]
+    fn renders_bug_section() {
+        let bug = Bug {
+            title: "Login does nothing".into(),
+            severity: "high".into(),
+            package: "com.example.app".into(),
+            body: "**Steps**\n\n1. Open\n".into(),
+        };
+        let history = vec!["launch_app com.example.app".to_string(), "tap [3] Button \"Log in\"".to_string()];
+        let text = render_bug(2, &bug, "15:06:12", &history, "![screenshot](bug-02.png)");
+        assert_eq!(
+            text,
+            "\n## Bug 2: Login does nothing\n\n- Severity: high\n- App: com.example.app\n- Time: 15:06:12\n\n\
+             **Steps**\n\n1. Open\n\n**Recent actions** (newest last)\n\n- launch_app com.example.app\n\
+             - tap [3] Button \"Log in\"\n\n![screenshot](bug-02.png)\n"
+        );
+    }
+
+    #[test]
+    fn keeps_recent_history_only() {
+        let mut state = test_state();
+        for i in 0..20 {
+            state.remember(format!("action {i}"));
+        }
+        assert_eq!(state.history.len(), MAX_HISTORY);
+        assert_eq!(state.history.first().unwrap(), "action 5");
+    }
+
+    #[test]
+    fn report_folders_never_collide() {
+        let root = std::env::temp_dir().join(format!("phantomqa-test-{}", std::process::id()));
+        let mut a = State::new(root.clone());
+        let mut b = State::new(root.clone());
+        let dir_a = report_dir(&mut a).unwrap();
+        let dir_b = report_dir(&mut b).unwrap();
+        assert_ne!(dir_a, dir_b);
+        assert_eq!(report_dir(&mut a).unwrap(), dir_a, "same run reuses its folder");
+        let header = fs::read_to_string(dir_a.join("report.md")).unwrap();
+        assert!(header.starts_with("# PhantomQA test report\n"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
