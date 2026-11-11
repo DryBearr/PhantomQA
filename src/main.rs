@@ -63,6 +63,12 @@ struct State {
     saved_crashes: Vec<(String, usize)>,
     /// The crash check failed once already; do not repeat the same warning after every action.
     crash_check_failed: bool,
+    /// The run folder `phantomqa run` made for this session, instead of a new one.
+    run_dir: Option<PathBuf>,
+    /// Button texts from the test file that tap and type_text refuse.
+    avoid: Vec<String>,
+    /// Env var with the test account password, for type_password.
+    password_env: Option<String>,
 }
 
 struct Report {
@@ -77,6 +83,8 @@ struct Report {
     session_video: Option<String>,
     /// Held while the session runs. The API sees a free lock on an unfinished run as "interrupted".
     lock: Option<fs::File>,
+    /// The test file's settings when `phantomqa run` started the run, else null.
+    test: Value,
 }
 
 impl State {
@@ -94,6 +102,9 @@ impl State {
             apps: Vec::new(),
             saved_crashes: Vec::new(),
             crash_check_failed: false,
+            run_dir: None,
+            avoid: Vec::new(),
+            password_env: None,
         }
     }
 
@@ -120,6 +131,8 @@ struct Config {
     serial: Option<String>,
     /// tokens.json: the hashed API tokens.
     tokens: PathBuf,
+    /// Claude Code, the agent `phantomqa run` starts.
+    claude: String,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -134,7 +147,7 @@ fn env_var(name: &str) -> Option<String> {
 
 /// Reads the options before the command. Returns the config and where the command starts.
 fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<(Config, usize), String> {
-    let (mut adb, mut ffmpeg, mut reports, mut serial, mut tokens) = (None, None, None, None, None);
+    let (mut adb, mut ffmpeg, mut reports, mut serial, mut tokens, mut claude) = (None, None, None, None, None, None);
     let (mut no_video, mut no_screenshots) = (false, false);
     let mut i = 0;
     while let Some(arg) = args.get(i).filter(|a| a.starts_with("--")) {
@@ -165,6 +178,7 @@ fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<
             "--reports" => &mut reports,
             "--serial" => &mut serial,
             "--tokens" => &mut tokens,
+            "--claude" => &mut claude,
             _ => return Err(format!("unknown option: {name}")),
         };
         let value = match inline {
@@ -209,6 +223,9 @@ fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<
             );
             std::path::absolute(&tokens).unwrap_or(tokens)
         },
+        claude: claude
+            .or_else(|| env("PHANTOMQA_CLAUDE"))
+            .unwrap_or_else(|| "claude".into()),
     };
     Ok((config, i))
 }
@@ -291,8 +308,13 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus,
     }
 }
 
-/// Runs adb with a timeout and returns its raw stdout.
+/// Runs adb with the usual timeout and returns its raw stdout.
 fn adb_bytes(args: &[&str]) -> Result<Vec<u8>, String> {
+    adb_bytes_for(args, ADB_TIMEOUT)
+}
+
+/// Runs adb with a timeout and returns its raw stdout.
+fn adb_bytes_for(args: &[&str], timeout: Duration) -> Result<Vec<u8>, String> {
     let mut child = adb_command()
         .args(args)
         .stdin(Stdio::null())
@@ -315,7 +337,7 @@ fn adb_bytes(args: &[&str]) -> Result<Vec<u8>, String> {
         buf
     });
 
-    let status = wait_with_timeout(&mut child, ADB_TIMEOUT).map_err(|e| format!("adb {}: {e}", args.join(" ")))?;
+    let status = wait_with_timeout(&mut child, timeout).map_err(|e| format!("adb {}: {e}", args.join(" ")))?;
 
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
@@ -687,8 +709,36 @@ fn element(state: &State, id: i64) -> Result<Element, String> {
         .ok_or_else(|| format!("no element [{id}] on the last screen. Call screen to see the current list."))
 }
 
-fn tap(state: &mut State, id: i64) -> Result<String, String> {
+/// The avoid entry an element's label matches. Ignores case, and the special dashes and spaces
+/// apps often use ("Wi\u{2011}Fi" matches "wi-fi").
+fn avoided<'a>(avoid: &'a [String], label: &str) -> Option<&'a str> {
+    let fold = |s: &str| -> String {
+        s.chars()
+            .map(|c| match c {
+                '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+                '\u{a0}' | '\u{2007}' | '\u{202f}' => ' ',
+                c => c,
+            })
+            .collect::<String>()
+            .to_lowercase()
+    };
+    let label = fold(label);
+    avoid.iter().find(|a| label.contains(&fold(a))).map(String::as_str)
+}
+
+/// An element the agent may press: on the last screen, and not on the test's avoid list.
+fn pressable(state: &State, id: i64) -> Result<Element, String> {
     let e = element(state, id)?;
+    match avoided(&state.avoid, &e.label) {
+        Some(entry) => Err(format!(
+            "refused: [{id}] matches {entry:?} from the test's avoid list. Do not press it; test something else."
+        )),
+        None => Ok(e),
+    }
+}
+
+fn tap(state: &mut State, id: i64) -> Result<String, String> {
+    let e = pressable(state, id)?;
     state.remember(format!("tap {}", describe(id, &e)));
     let (x, y) = e.center;
     adb(&["shell", "input", "tap", &x.to_string(), &y.to_string()])?;
@@ -721,15 +771,19 @@ fn input_text_args(text: &str) -> Result<Vec<String>, String> {
 }
 
 fn type_text(state: &mut State, id: i64, text: &str) -> Result<String, String> {
+    type_into(state, id, text, "type_text")
+}
+
+fn type_into(state: &mut State, id: i64, text: &str, action: &str) -> Result<String, String> {
     let args = input_text_args(text)?;
-    let e = element(state, id)?;
+    let e = pressable(state, id)?;
     // Keep passwords out of the report.
     let shown = if e.flags.contains(&"password") {
         "(hidden)".to_string()
     } else {
         format!("{text:?}")
     };
-    state.remember(format!("type_text {}: {shown}", describe(id, &e)));
+    state.remember(format!("{action} {}: {shown}", describe(id, &e)));
     let (x, y) = e.center;
     adb(&["shell", "input", "tap", &x.to_string(), &y.to_string()])?;
     sleep(Duration::from_millis(300));
@@ -740,11 +794,48 @@ fn type_text(state: &mut State, id: i64, text: &str) -> Result<String, String> {
     read_screen(state)
 }
 
+/// The test account password, from the env var the test file names.
+fn password(state: &State) -> Result<String, String> {
+    let name = state
+        .password_env
+        .as_deref()
+        .ok_or("no test password: type_password works in `phantomqa run`, with \"login\" in the test file")?;
+    env_var(name).ok_or_else(|| format!("the test password is missing: {name} is not set"))
+}
+
+/// Types the test password into a password field. The agent never sees the password.
+fn type_password(state: &mut State, id: i64) -> Result<String, String> {
+    let secret = password(state)?;
+    // An error about the text could quote part of the password.
+    input_text_args(&secret).map_err(|_| "the test password has characters PhantomQA cannot type".to_string())?;
+    let e = pressable(state, id)?;
+    // A normal field would show the password on screen, and so to the agent.
+    if !e.flags.contains(&"password") {
+        return Err(format!(
+            "[{id}] is not a password field. type_password types only into fields marked password; use type_text for the user name."
+        ));
+    }
+    type_into(state, id, &secret, "type_password")
+}
+
+/// Hides the test password wherever it shows up in text that leaves PhantomQA.
+fn redact(state: &State, text: String) -> String {
+    match password(state) {
+        // Very short secrets would hide ordinary text too.
+        Ok(secret) if secret.len() >= 4 => text.replace(&secret, "(hidden)"),
+        _ => text,
+    }
+}
+
 fn back(state: &mut State) -> Result<String, String> {
     state.remember("back".into());
     adb(&["shell", "input", "keyevent", "KEYCODE_BACK"])?;
     sleep(SETTLE);
     read_screen(state)
+}
+
+fn installed(package: &str) -> bool {
+    adb(&["shell", "pm", "path", package]).is_ok_and(|p| p.contains("package:"))
 }
 
 fn launch_app(state: &mut State, package: &str) -> Result<String, String> {
@@ -783,8 +874,7 @@ fn launch_app(state: &mut State, package: &str) -> Result<String, String> {
         }
         None => {
             // Not installed is the common case; say so plainly.
-            let installed = adb(&["shell", "pm", "path", package]).is_ok_and(|p| p.contains("package:"));
-            if !installed {
+            if !installed(package) {
                 return Err(format!("{package} is not installed"));
             }
             // monkey exits with an error when there is nothing to start, so read its output either way.
@@ -1064,12 +1154,28 @@ fn next_run_number(root: &Path) -> usize {
     highest.map_or(1, |n| n + 1)
 }
 
-/// The report folder, reports/run-NNN. Creates it with report.md on first use.
+/// The report folder, reports/run-NNN. Creates it with report.md on first use, or takes over
+/// the folder that `phantomqa run` made for this session.
 fn report_dir(state: &mut State) -> Result<PathBuf, String> {
     if let Some(report) = &state.report {
         return Ok(report.dir.clone());
     }
-    let root = &state.report_root;
+    let report = match &state.run_dir {
+        Some(dir) => adopt_run(dir)?,
+        None => create_run(&state.report_root, Value::Null)?,
+    };
+    state.avoid = report.test["avoid"]
+        .as_array()
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    state.password_env = report.test["login"]["password_env"].as_str().map(str::to_string);
+    let dir = report.dir.clone();
+    state.report = Some(report);
+    Ok(dir)
+}
+
+/// Makes the next run-NNN folder with report.md and run.json, and holds its lock.
+fn create_run(root: &Path, test: Value) -> Result<Report, String> {
     fs::create_dir_all(root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
     let mut run = next_run_number(root);
     let dir = loop {
@@ -1082,33 +1188,84 @@ fn report_dir(state: &mut State) -> Result<PathBuf, String> {
         }
     };
     let device = device_name().unwrap_or_else(|_| "unknown".into());
-    let header = format!("# PhantomQA test report: run {run}\n\n- Device: {device}\n");
+    let mut header = format!("# PhantomQA test report: run {run}\n\n- Device: {device}\n");
+    for (key, label) in [("app", "App"), ("file", "Test"), ("goal", "Goal"), ("model", "Model")] {
+        if let Some(value) = test[key].as_str() {
+            header.push_str(&format!("- {label}: {}\n", one_line(value, 300)));
+        }
+    }
     fs::write(dir.join("report.md"), header).map_err(|e| format!("cannot write report.md: {e}"))?;
-    let lock = fs::File::create(dir.join(RUN_LOCK))
-        .ok()
-        .filter(|file| file.try_lock().is_ok());
     let report = Report {
-        dir: dir.clone(),
+        lock: hold_run_lock(&dir),
+        dir,
         run,
         device,
         bugs: 0,
         bug_list: Vec::new(),
         finished: false,
         session_video: None,
-        lock,
+        test,
     };
     write_run_json(&report)?;
-    state.report = Some(report);
-    Ok(dir)
+    Ok(report)
 }
 
-/// Hidden lock file in a run folder, held by the session while it runs.
+/// Takes over a run folder made by `phantomqa run`, keeping what its run.json already has.
+fn adopt_run(dir: &Path) -> Result<Report, String> {
+    let doc = read_json(&dir.join("run.json"))?;
+    let run = doc["run"]
+        .as_u64()
+        .ok_or_else(|| format!("{} has no run number", dir.join("run.json").display()))?;
+    let bug_list = doc["bugs"].as_array().cloned().unwrap_or_default();
+    Ok(Report {
+        lock: hold_run_lock(dir),
+        dir: dir.to_path_buf(),
+        run: run as usize,
+        device: doc["device"].as_str().unwrap_or("unknown").to_string(),
+        bugs: bug_list.len(),
+        bug_list,
+        finished: false,
+        session_video: None,
+        test: doc["test"].clone(),
+    })
+}
+
+/// Hidden lock file in a run folder. Everyone working on the run holds a shared lock on it:
+/// the session, and `phantomqa run` around it. The API sees a free lock on an unfinished run
+/// as "interrupted".
 const RUN_LOCK: &str = ".lock";
 const RUN_FILE_VERSION: u64 = 1;
 
-/// Writes run.json atomically, so the API never reads half a file.
+fn hold_run_lock(dir: &Path) -> Option<fs::File> {
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(RUN_LOCK))
+        .ok()
+        .filter(|file| file.lock_shared().is_ok())
+}
+
+fn read_json(path: &Path) -> Result<Value, String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    serde_json::from_str(&text).map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
+}
+
+/// Writes a JSON file atomically, so a reader never sees half a file.
+fn write_json(path: &Path, doc: &Value) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(doc).map_err(|e| e.to_string())?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    fs::write(&tmp, text + "\n")
+        .and_then(|()| fs::rename(&tmp, path))
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("cannot write {}: {e}", path.display())
+        })
+}
+
 fn write_run_json(report: &Report) -> Result<(), String> {
-    let doc = json!({
+    let mut doc = json!({
         "version": RUN_FILE_VERSION,
         "run": report.run,
         "status": if report.finished { "finished" } else { "running" },
@@ -1116,12 +1273,15 @@ fn write_run_json(report: &Report) -> Result<(), String> {
         "bugs": report.bug_list,
         "session_video": report.session_video,
     });
-    let text = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
-    let tmp = report.dir.join(".run.json.tmp");
-    let path = report.dir.join("run.json");
-    fs::write(&tmp, text + "\n")
-        .and_then(|()| fs::rename(&tmp, &path))
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+    if !report.test.is_null() {
+        doc["test"] = report.test.clone();
+    }
+    write_json(&report.dir.join("run.json"), &doc)
+}
+
+/// Logs to stderr. Never panics: the agent may have closed the pipe.
+fn warn(message: &str) {
+    let _ = writeln!(std::io::stderr(), "phantomqa: {message}");
 }
 
 /// The app's recent log, or recent warnings and errors when the app is not running.
@@ -1187,7 +1347,7 @@ fn save_bug(state: &mut State, bug: &Bug, extra_log: &str) -> Result<usize, Stri
             Err(e) => format!("(no screenshot: {e})"),
         });
     }
-    let log = format!("{extra_log}{}", app_log(&bug.package));
+    let log = redact(state, format!("{extra_log}{}", app_log(&bug.package)));
     attachments.push(match fs::write(dir.join(format!("{name}.log")), log) {
         Ok(()) => {
             files.insert("log".into(), json!(format!("{name}.log")));
@@ -1226,7 +1386,7 @@ fn save_bug(state: &mut State, bug: &Bug, extra_log: &str) -> Result<usize, Stri
         }));
         // report.md already has the bug; a failed run.json write must not lose it.
         if let Err(e) = write_run_json(report) {
-            eprintln!("phantomqa: {e}");
+            warn(&e);
         }
     }
     Ok(n)
@@ -1381,7 +1541,7 @@ fn lock(shared: &Shared) -> MutexGuard<'_, Recorder> {
 /// The first tool call of an MCP session starts its run: the report folder, then video.
 fn start_run(state: &mut State) {
     if let Err(e) = report_dir(state) {
-        eprintln!("phantomqa: {e}");
+        warn(&e);
     }
     start_video(state);
 }
@@ -1764,7 +1924,7 @@ fn finish_session(state: &mut State) {
         .is_file()
         .then(|| "session.mp4".to_string());
     if let Err(e) = write_run_json(report) {
-        eprintln!("phantomqa: {e}");
+        warn(&e);
     }
     report.lock = None;
 }
@@ -1773,6 +1933,7 @@ fn finish_session(state: &mut State) {
 
 const INSTRUCTIONS: &str = "PhantomQA lets you test an Android app on an emulator like a real user. \
 Start with launch_app, read the numbered screen list, and use tap, type_text and back. \
+For a test account password, use type_password; you never see the password. \
 Try the main features, wrong inputs and edge cases. Call report_bug for each problem while it is on screen, \
 with clear steps to reproduce. Crashes and ANRs are found and saved automatically.";
 
@@ -1803,6 +1964,15 @@ fn tool_list() -> Value {
                     "text": {"type": "string", "description": "Text to type"},
                 },
                 "required": ["id", "text"],
+            },
+        },
+        {
+            "name": "type_password",
+            "description": "Tap password field [id] and type the test account password into it. You never see the password. Works when the test file has a login. Returns the new screen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "integer", "description": "Element number of the password field"}},
+                "required": ["id"],
             },
         },
         {
@@ -1855,6 +2025,11 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
     if !state.video_checked {
         start_run(state);
     }
+    // Under `phantomqa run`, acting without the run folder would also act without the avoid list.
+    if state.run_dir.is_some() && state.report.is_none() {
+        let text = "PhantomQA cannot open its run folder, so it refuses to act. Stop the test.";
+        return json!({"content": [{"type": "text", "text": text}], "isError": true});
+    }
     // Start the crash clock before the first action, so a crash it causes is not missed.
     if state.crash_since.is_none() {
         state.crash_since = device_now().ok();
@@ -1863,13 +2038,17 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
         "screen" => read_screen(state),
         "tap" => int("id").and_then(|id| tap(state, id)),
         "type_text" => int("id").and_then(|id| text("text").and_then(|t| type_text(state, id, &t))),
+        "type_password" => int("id").and_then(|id| type_password(state, id)),
         "back" => back(state),
         "launch_app" => text("package").and_then(|p| launch_app(state, &p)),
         "crashes" => Ok(String::new()),
         "report_bug" => report_bug(state, args),
         _ => Err(format!("unknown tool: {name}")),
     };
-    let checks_crashes = matches!(name, "screen" | "tap" | "type_text" | "back" | "launch_app" | "crashes");
+    let checks_crashes = matches!(
+        name,
+        "screen" | "tap" | "type_text" | "type_password" | "back" | "launch_app" | "crashes"
+    );
     let notice = if checks_crashes {
         crash_notice(state)
     } else {
@@ -1884,6 +2063,7 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
         text = "No new crashes or ANRs.".into();
     }
     text.push_str(&notice);
+    let text = redact(state, text);
     json!({"content": [{"type": "text", "text": text.trim_start()}], "isError": is_error})
 }
 
@@ -1960,6 +2140,62 @@ fn serve_mcp(mut state: State) {
     }
     // The client closed stdin: the test session is over.
     finish_session(&mut state);
+}
+
+/// Set for the MCP worker process, which does the real work.
+const WORKER_ENV: &str = "PHANTOMQA_MCP_WORKER";
+
+/// Runs the MCP server in a child process with its own process group, and passes messages
+/// through. Agents kill their MCP server a fraction of a second after they exit (Claude Code
+/// sends SIGINT, SIGTERM, then SIGKILL). The worker is not hit by that: it sees stdin close and
+/// finishes the session properly (last video part, session.mp4, run.json).
+/// Returns false if the worker cannot start; the server then runs in this process.
+fn relay_mcp() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut command = Command::new(exe);
+    command
+        .args(std::env::args_os().skip(1))
+        .env(WORKER_ENV, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut worker = match command.spawn() {
+        Ok(worker) => worker,
+        Err(e) => {
+            warn(&format!(
+                "cannot start the MCP worker, so a killed agent may cut the session short: {e}"
+            ));
+            return false;
+        }
+    };
+    let mut to_worker = worker.stdin.take().expect("stdin is piped");
+    // When stdin closes, to_worker is dropped, and the worker sees the end of the session.
+    std::thread::spawn(move || pass_through(&mut std::io::stdin(), &mut to_worker));
+    let mut from_worker = worker.stdout.take().expect("stdout is piped");
+    pass_through(&mut from_worker, &mut std::io::stdout());
+    let _ = worker.wait();
+    true
+}
+
+/// Copies bytes as they come, until either side closes. Not io::copy: on Linux it uses splice,
+/// which can wait for more data on the socket pairs that Node and Bun agents use for stdio.
+fn pass_through(from: &mut dyn Read, to: &mut dyn Write) {
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        if to.write_all(&buf[..n]).and_then(|()| to.flush()).is_err() {
+            return;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- tokens
@@ -2601,12 +2837,12 @@ fn list_runs_reply(reports: &Path, query: &str) -> Reply {
     Reply::json(200, &json!({"runs": runs}))
 }
 
-/// True while a session holds the run's lock.
+/// True while someone holds the run's lock (the session, or `phantomqa run`).
 fn run_is_active(dir: &Path) -> bool {
     let Ok(file) = fs::File::open(dir.join(RUN_LOCK)) else {
         return false;
     };
-    matches!(file.try_lock_shared(), Err(fs::TryLockError::WouldBlock))
+    matches!(file.try_lock(), Err(fs::TryLockError::WouldBlock))
 }
 
 /// A run's details from its run.json, with a status that also notices killed sessions.
@@ -2641,14 +2877,21 @@ fn run_detail(dir: &Path, n: usize) -> Value {
         Some("running") => "interrupted",
         _ => "broken",
     };
-    json!({
+    let mut run = json!({
         "run": n,
         "status": status,
         "device": doc["device"].as_str().unwrap_or(""),
         "bugs": doc["bugs"],
         "session_video": doc["session_video"].as_str(),
         "files": files,
-    })
+    });
+    // Runs started by `phantomqa run` also say what was tested and how the agent did.
+    for key in ["test", "agent"] {
+        if doc[key].is_object() {
+            run[key] = doc[key].clone();
+        }
+    }
+    run
 }
 
 /// Visible files of a run folder, including video parts, sorted.
@@ -2888,6 +3131,545 @@ fn handle_http(request: tiny_http::Request, reports: &Path, tokens: &Path) {
     }
 }
 
+// ---------------------------------------------------------------- test runs
+//
+// `phantomqa run shop.json` tests one app without a person: it installs the app if asked,
+// makes the run folder, starts Claude Code with PhantomQA as its only tools, and stops it at
+// the time limit. The session itself runs in the MCP worker, which takes over the folder.
+
+const TEST_FIELDS: [&str; 7] = ["app", "apk", "goal", "avoid", "login", "model", "max_minutes"];
+const LOGIN_FIELDS: [&str; 2] = ["user", "password_env"];
+const DEFAULT_MODEL: &str = "sonnet";
+const DEFAULT_MAX_MINUTES: u64 = 30;
+const MAX_MINUTES: u64 = 24 * 60;
+/// Big APKs on slow devices take a while.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
+/// After the agent stops: the last video part plus joining session.mp4.
+const FINISH_TIMEOUT: Duration = Duration::from_secs(400);
+/// Tells the MCP worker which run folder to take over.
+const RUN_DIR_ENV: &str = "PHANTOMQA_RUN_DIR";
+
+/// A test file, checked.
+#[derive(Debug, PartialEq)]
+struct TestFile {
+    /// The file name, for reports.
+    name: String,
+    app: String,
+    goal: String,
+    /// Relative paths in the file are relative to the file.
+    apk: Option<PathBuf>,
+    avoid: Vec<String>,
+    login: Option<Login>,
+    model: String,
+    max_minutes: u64,
+}
+
+#[derive(Debug, PartialEq)]
+struct Login {
+    user: String,
+    /// The name of the env var with the password. The password itself is never in the file.
+    password_env: String,
+}
+
+fn load_test(path: &Path) -> Result<TestFile, String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let base = path.parent().unwrap_or(Path::new("."));
+    let mut test = parse_test(&text, base).map_err(|e| format!("{}: {e}", path.display()))?;
+    test.name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(test)
+}
+
+fn minutes(n: u64) -> String {
+    format!("{n} minute{}", if n == 1 { "" } else { "s" })
+}
+
+fn valid_env_name(name: &str) -> bool {
+    name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Checks every field. Unknown fields are errors, so a typo never goes unnoticed.
+fn parse_test(text: &str, base: &Path) -> Result<TestFile, String> {
+    let doc: Value = serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
+    let obj = doc
+        .as_object()
+        .ok_or("must be a JSON object, like {\"app\": \"com.example.app\", \"goal\": \"...\"}")?;
+    let unknown = |obj: &serde_json::Map<String, Value>, fields: &[&str]| -> Result<(), String> {
+        match obj.keys().find(|k| !fields.contains(&k.as_str())) {
+            Some(key) => Err(format!("unknown field {key:?}; the fields are {}", fields.join(", "))),
+            None => Ok(()),
+        }
+    };
+    let text_field = |obj: &serde_json::Map<String, Value>, key: &str| -> Result<Option<String>, String> {
+        match obj.get(key) {
+            None => Ok(None),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            Some(_) => Err(format!("{key:?} must be a non-empty string")),
+        }
+    };
+    unknown(obj, &TEST_FIELDS)?;
+
+    let app = text_field(obj, "app")?.ok_or("\"app\" is required: the package name, like com.example.app")?;
+    if !valid_package(&app) {
+        return Err(format!("\"app\" is not a package name: {app:?}"));
+    }
+    let goal = text_field(obj, "goal")?.ok_or("\"goal\" is required: what to test, in plain words")?;
+    let apk = text_field(obj, "apk")?.map(|apk| base.join(apk));
+    let model = text_field(obj, "model")?.unwrap_or_else(|| DEFAULT_MODEL.into());
+    if !model.chars().all(|c| c.is_ascii_alphanumeric() || "._-[]".contains(c)) {
+        return Err(format!("\"model\" is not a model name: {model:?}"));
+    }
+    let max_minutes = match obj.get("max_minutes") {
+        None => DEFAULT_MAX_MINUTES,
+        Some(v) => v.as_u64().filter(|m| (1..=MAX_MINUTES).contains(m)).ok_or(format!(
+            "\"max_minutes\" must be a whole number from 1 to {MAX_MINUTES}"
+        ))?,
+    };
+    let avoid_error = "\"avoid\" must be a list of button texts, like [\"Delete account\", \"Pay now\"]";
+    let avoid = match obj.get("avoid") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .ok_or(avoid_error)
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(avoid_error.into()),
+    };
+    let login = match obj.get("login") {
+        None => None,
+        Some(Value::Object(login)) => {
+            unknown(login, &LOGIN_FIELDS).map_err(|e| format!("\"login\": {e}"))?;
+            let user =
+                text_field(login, "user")?.ok_or("\"login\" needs \"user\": the test account's email or user name")?;
+            if input_text_args(&user).is_err() {
+                return Err("\"login\".\"user\" must be printable ASCII".into());
+            }
+            let password_env = text_field(login, "password_env")?.ok_or(
+                "\"login\" needs \"password_env\": the env var that holds the password, like SHOP_QA_PASSWORD",
+            )?;
+            if !valid_env_name(&password_env) {
+                return Err(format!(
+                    "\"password_env\" must be an env var name, like SHOP_QA_PASSWORD, not {password_env:?}. Never put the password itself in the file."
+                ));
+            }
+            Some(Login { user, password_env })
+        }
+        Some(_) => return Err("\"login\" must be an object: {\"user\": \"...\", \"password_env\": \"...\"}".into()),
+    };
+    Ok(TestFile {
+        name: String::new(),
+        app,
+        goal,
+        apk,
+        avoid,
+        login,
+        model,
+        max_minutes,
+    })
+}
+
+impl TestFile {
+    /// What run.json keeps about the test. File names only, no local paths.
+    fn to_json(&self) -> Value {
+        let file_name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+        let mut doc = json!({
+            "file": self.name,
+            "app": self.app,
+            "goal": self.goal,
+            "avoid": self.avoid,
+            "model": self.model,
+            "max_minutes": self.max_minutes,
+        });
+        if let Some(apk) = self.apk.as_deref().and_then(file_name) {
+            doc["apk"] = json!(apk);
+        }
+        if let Some(login) = &self.login {
+            doc["login"] = json!({"user": login.user, "password_env": login.password_env});
+        }
+        doc
+    }
+
+    /// The task for the agent.
+    fn prompt(&self) -> String {
+        let mut out = format!(
+            "You are an AI QA tester. Test the Android app {} on the connected device with the PhantomQA tools.\n\nGoal: {}\n\nHow to work:\n",
+            self.app, self.goal
+        );
+        out.push_str(&format!("- Start with launch_app {}.\n", self.app));
+        out.push_str("- Work toward the goal like a careful tester: the main flows, wrong inputs and edge cases.\n");
+        out.push_str("- Call report_bug for each problem while it is on screen, with clear steps. Crashes and ANRs are saved automatically; do not report them again.\n");
+        if !self.avoid.is_empty() {
+            let list: Vec<String> = self.avoid.iter().map(|a| format!("{a:?}")).collect();
+            out.push_str(&format!(
+                "- Never press these: {}. PhantomQA refuses them.\n",
+                list.join(", ")
+            ));
+        }
+        if let Some(login) = &self.login {
+            out.push_str(&format!(
+                "- When the app asks you to sign in, type {:?} with type_text as the email or user name, and use type_password for the password field. You never see the password.\n",
+                login.user
+            ));
+        }
+        out.push_str(&format!(
+            "- You have about {}. Stop when the goal is covered.\n- End with a short summary: what you tested, what worked, and the bugs you found.\n",
+            minutes(self.max_minutes)
+        ));
+        out
+    }
+}
+
+/// Holds the device for one run, so two runs never drive the same device.
+fn device_lock() -> Result<fs::File, String> {
+    let serial = adb(&["get-serialno"]).map_err(|e| {
+        format!("{e}. Start an emulator or connect a phone; with several devices, set --serial or ANDROID_SERIAL.")
+    })?;
+    let serial = serial.trim();
+    if serial.is_empty() || serial == "unknown" {
+        return Err("no device found. Start an emulator or connect a phone.".into());
+    }
+    let safe: String = serial
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = std::env::temp_dir().join(format!("phantomqa-device-{safe}.lock"));
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(format!("device {serial} is busy with another phantomqa run")),
+        Err(fs::TryLockError::Error(e)) => Err(format!("cannot lock {}: {e}", path.display())),
+    }
+}
+
+fn install_apk(apk: &Path, app: &str) -> Result<(), String> {
+    if !apk.is_file() {
+        return Err(format!("apk not found: {}", apk.display()));
+    }
+    let path = apk.to_str().ok_or("the apk path must be valid UTF-8")?;
+    // -r: replace the installed app and keep its data. -t: allow debug builds marked test-only.
+    let out = adb_bytes_for(&["install", "-r", "-t", path], INSTALL_TIMEOUT)
+        .map(|out| String::from_utf8_lossy(&out).into_owned())
+        .unwrap_or_else(|e| e);
+    if !out.contains("Success") {
+        let hint = if out.contains("UPDATE_INCOMPATIBLE") {
+            " The installed app has a different signature: uninstall it first (this deletes its data)."
+        } else {
+            ""
+        };
+        return Err(format!(
+            "could not install the apk: {}.{hint}",
+            one_line(out.trim(), 300)
+        ));
+    }
+    if !installed(app) {
+        return Err(format!(
+            "the apk installed, but {app} is still not on the device: check that \"app\" is the apk's package name"
+        ));
+    }
+    Ok(())
+}
+
+/// MCP config for the agent: this binary, with the same options, taking over the run folder.
+fn mcp_config(run_dir: &Path) -> Result<Value, String> {
+    let config = config();
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find the phantomqa binary: {e}"))?;
+    let mut args = vec![
+        "--adb".to_string(),
+        config.adb.clone(),
+        "--reports".into(),
+        config.reports.to_string_lossy().into_owned(),
+    ];
+    if let Some(serial) = &config.serial {
+        args.extend(["--serial".into(), serial.clone()]);
+    }
+    if let Some(ffmpeg) = &config.ffmpeg {
+        args.extend(["--ffmpeg".into(), ffmpeg.clone()]);
+    }
+    if !config.video {
+        args.push("--no-video".into());
+    }
+    if !config.screenshots {
+        args.push("--no-screenshots".into());
+    }
+    args.push("mcp".into());
+    Ok(json!({"mcpServers": {"phantomqa": {
+        "type": "stdio",
+        "command": exe,
+        "args": args,
+        "env": {RUN_DIR_ENV: run_dir},
+    }}}))
+}
+
+/// How the agent's part went.
+struct AgentRun {
+    /// "done", "time limit" or "error".
+    ended: &'static str,
+    summary: String,
+    cost_usd: Option<f64>,
+    turns: Option<u64>,
+    error: Option<String>,
+}
+
+/// Starts Claude Code with PhantomQA as its only tools and waits, up to the time limit.
+fn run_claude(test: &TestFile, run_dir: &Path, mcp_file: &Path) -> AgentRun {
+    let claude = &config().claude;
+    let failed = |error: String| AgentRun {
+        ended: "error",
+        summary: String::new(),
+        cost_usd: None,
+        turns: None,
+        error: Some(error),
+    };
+    let mut command = Command::new(claude);
+    command
+        .args(["-p", &test.prompt(), "--model", &test.model, "--mcp-config"])
+        .arg(mcp_file)
+        .args([
+            "--strict-mcp-config",
+            // No built-in tools (no shell, no files): only PhantomQA's.
+            "--tools",
+            "",
+            "--allowedTools",
+            "mcp__phantomqa",
+            "--permission-prompts",
+            "none",
+            // Leave out the user's own settings and hooks, so every run behaves the same.
+            "--setting-sources",
+            "",
+            "--no-session-persistence",
+            "--output-format",
+            "json",
+        ])
+        // Connect the MCP server before the first turn. By default Claude Code connects it in
+        // the background, and a fast model can answer before the tools exist.
+        .env("MCP_CONNECTION_NONBLOCKING", "0")
+        .current_dir(run_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return failed(format!("cannot run {claude}: {e}")),
+    };
+    let (sender, receiver) = mpsc::channel();
+    for (n, pipe) in [
+        child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
+        child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            let _ = sender.send((n, buf));
+        });
+    }
+    let limit = Duration::from_secs(test.max_minutes * 60);
+    let start = Instant::now();
+    let (status, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (Some(status), false),
+            Ok(None) if start.elapsed() > limit => {
+                // The worker sees the agent go and finishes the session by itself.
+                let _ = child.kill();
+                let _ = child.wait();
+                break (None, true);
+            }
+            Ok(None) => sleep(Duration::from_millis(200)),
+            Err(e) => return failed(format!("lost track of {claude}: {e}")),
+        }
+    };
+    // A helper of the agent may keep a pipe open; do not wait for it forever.
+    let mut out = [Vec::new(), Vec::new()];
+    for _ in 0..2 {
+        if let Ok((n, buf)) = receiver.recv_timeout(Duration::from_secs(5)) {
+            out[n] = buf;
+        }
+    }
+    let stderr = String::from_utf8_lossy(&out[1]);
+    match serde_json::from_slice::<Value>(&out[0]) {
+        Ok(doc) if doc.is_object() => {
+            let is_error = doc["is_error"].as_bool().unwrap_or(false);
+            let summary = doc["result"].as_str().unwrap_or("").trim().to_string();
+            AgentRun {
+                ended: if is_error { "error" } else { "done" },
+                error: is_error.then(|| {
+                    let reason = if summary.is_empty() {
+                        doc["subtype"].as_str().unwrap_or("unknown")
+                    } else {
+                        &summary
+                    };
+                    one_line(reason, 500)
+                }),
+                summary,
+                cost_usd: doc["total_cost_usd"].as_f64(),
+                turns: doc["num_turns"].as_u64(),
+            }
+        }
+        _ if timed_out => AgentRun {
+            ended: "time limit",
+            summary: String::new(),
+            cost_usd: None,
+            turns: None,
+            error: None,
+        },
+        _ => {
+            let detail = match status {
+                Some(status) if !stderr.trim().is_empty() => {
+                    format!("{claude} failed ({status}): {}", one_line(stderr.trim(), 500))
+                }
+                Some(status) => format!("{claude} failed ({status}) without saying why"),
+                None => format!("{claude} failed"),
+            };
+            failed(detail)
+        }
+    }
+}
+
+/// Waits until the worker has finished the session, or is gone.
+fn wait_for_finish(run_dir: &Path) -> bool {
+    let start = Instant::now();
+    loop {
+        if read_json(&run_dir.join("run.json")).is_ok_and(|doc| doc["status"] == "finished") {
+            return true;
+        }
+        // A worker that never started (the agent failed early) never takes the lock.
+        let gone = !run_is_active(run_dir) && start.elapsed() > Duration::from_secs(3);
+        if gone || start.elapsed() > FINISH_TIMEOUT {
+            return false;
+        }
+        sleep(Duration::from_millis(250));
+    }
+}
+
+/// `phantomqa run FILE`. Returns the summary and the exit code: 0 no bugs, 1 bugs, 2 failed.
+fn run_test(path: &str) -> Result<(String, i32), String> {
+    let config = config();
+    let test = load_test(Path::new(path))?;
+    if let Some(login) = &test.login {
+        let name = &login.password_env;
+        let password = env_var(name).ok_or_else(|| {
+            format!("{name} is not set. Set it to the test account password before the run: export {name}='...'")
+        })?;
+        if input_text_args(&password).is_err() {
+            return Err(format!(
+                "{name} has characters PhantomQA cannot type: printable ASCII only"
+            ));
+        }
+    }
+    first_line(&config.claude, "--version")
+        .map_err(|e| format!("{e}. Install Claude Code, or set --claude or PHANTOMQA_CLAUDE."))?;
+    let _device = device_lock()?;
+    match &test.apk {
+        Some(apk) => install_apk(apk, &test.app)?,
+        None if !installed(&test.app) => {
+            return Err(format!(
+                "{} is not installed on the device. Install it, or set \"apk\" in the test file.",
+                test.app
+            ));
+        }
+        None => {}
+    }
+
+    let mut report = create_run(&config.reports, test.to_json())?;
+    let dir = report.dir.clone();
+    let mcp_file = dir.join(".mcp.json");
+    write_json(&mcp_file, &mcp_config(&dir)?)?;
+    warn(&format!(
+        "run {}: testing {} with {} for up to {}",
+        report.run,
+        test.app,
+        test.model,
+        minutes(test.max_minutes)
+    ));
+    let mut agent = run_claude(&test, &dir, &mcp_file);
+    // From here on only the worker holds the lock, while it finishes the session.
+    report.lock = None;
+    let finished = wait_for_finish(&dir);
+    let _ = fs::remove_file(&mcp_file);
+    // The session starts with the first tool call. No session means the agent did no testing.
+    if !finished && agent.ended == "done" {
+        agent.ended = "error";
+        agent.error = Some(
+            "the test session did not finish: the agent made no PhantomQA tool calls, or the session was killed".into(),
+        );
+    }
+
+    let mut doc = read_json(&dir.join("run.json")).unwrap_or_else(|_| json!({}));
+    let mut state = State::new(config.reports.clone());
+    state.password_env = test.login.as_ref().map(|l| l.password_env.clone());
+    let summary = redact(&state, agent.summary.clone());
+    doc["agent"] = json!({
+        "name": "claude",
+        "model": test.model,
+        "ended": agent.ended,
+        "summary": summary,
+        "cost_usd": agent.cost_usd,
+        "turns": agent.turns,
+        "error": agent.error,
+    });
+    if let Err(e) = write_json(&dir.join("run.json"), &doc) {
+        warn(&e);
+    }
+    let bugs = doc["bugs"].as_array().map_or(0, Vec::len);
+    let mut section = format!("\n## Agent\n\n- Model: {}\n- Ended: {}\n", test.model, agent.ended);
+    if let Some(cost) = agent.cost_usd {
+        section.push_str(&format!("- Cost: ${cost:.2}, {} turns\n", agent.turns.unwrap_or(0)));
+    }
+    if let Some(error) = &agent.error {
+        section.push_str(&format!("- Error: {error}\n"));
+    }
+    if !summary.is_empty() {
+        section.push_str(&format!("\n{summary}\n"));
+    }
+    let _ = fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("report.md"))
+        .and_then(|mut file| file.write_all(section.as_bytes()));
+
+    let mut line = format!("run {}: {bugs} bug{}", report.run, if bugs == 1 { "" } else { "s" });
+    line.push_str(&format!(", agent {}", agent.ended));
+    if let Some(cost) = agent.cost_usd {
+        line.push_str(&format!(" (${cost:.2})"));
+    }
+    if !finished {
+        line.push_str(", session did not finish");
+    }
+    if let Some(error) = &agent.error {
+        line.push_str(&format!("\nerror: {error}"));
+    }
+    line.push_str(&format!("\nreport: {}\n", dir.join("report.md").display()));
+    let code = match (agent.ended, bugs) {
+        (_, n) if n > 0 => 1,
+        ("error", _) => 2,
+        _ => 0,
+    };
+    Ok((line, code))
+}
+
 // ---------------------------------------------------------------- doctor
 
 /// Prints one line per check. Returns false if something required is missing.
@@ -2980,6 +3762,14 @@ fn doctor() -> bool {
         "only `serve` needs them: phantomqa token add NAME",
     );
 
+    let claude = first_line(&config.claude, "--version").map(|v| format!("{v} ({})", config.claude));
+    check(
+        false,
+        "claude",
+        claude,
+        "only `run` needs it: install Claude Code, or set --claude or PHANTOMQA_CLAUDE",
+    );
+
     let on_off = |on: bool| if on { "on" } else { "off" };
     println!(
         "info  video: {}, screenshots: {}",
@@ -2995,6 +3785,7 @@ const USAGE: &str = "usage: phantomqa [options] <command>
 
 commands:
   mcp                 MCP server over stdio (for Claude Code and other agents)
+  run FILE            test an app by itself: Claude Code follows the test file (exit 0 no bugs, 1 bugs, 2 failed)
   doctor              check adb, the device, ffmpeg and the reports folder
   screen              print the current screen
   tap N               tap element N
@@ -3012,7 +3803,8 @@ options (each also has an env var):
   --ffmpeg PATH       ffmpeg, optional      FFMPEG  (default: PATH)
   --no-video          do not record video   PHANTOMQA_VIDEO=0
   --no-screenshots    no screenshots        PHANTOMQA_SCREENSHOTS=0
-  --tokens PATH       API tokens file       PHANTOMQA_TOKENS  (default: tokens.json)";
+  --tokens PATH       API tokens file       PHANTOMQA_TOKENS  (default: tokens.json)
+  --claude PATH       Claude Code, for run  PHANTOMQA_CLAUDE  (default: claude on PATH)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -3040,9 +3832,23 @@ fn main() {
 
     let result = match args[..] {
         ["mcp"] => {
+            if std::env::var_os(WORKER_ENV).is_none() && relay_mcp() {
+                return;
+            }
+            state.run_dir = env_var(RUN_DIR_ENV).map(PathBuf::from);
             serve_mcp(state);
             return;
         }
+        ["run", file] => match run_test(file) {
+            Ok((text, code)) => {
+                print!("{text}");
+                std::process::exit(code);
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(2);
+            }
+        },
         ["doctor"] => std::process::exit(if doctor() { 0 } else { 1 }),
         ["token", ref rest @ ..] => token_command(rest),
         ["serve", ref rest @ ..] => serve(rest),
@@ -3192,7 +3998,7 @@ mod tests {
 
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let tools = handle_message(&mut state, &list).unwrap();
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
 
         let bad_tap = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "tap", "arguments": {"id": "x"}}});
         let reply = handle_message(&mut state, &bad_tap).unwrap();
@@ -3874,6 +4680,17 @@ mod tests {
         }
     }
 
+    /// Parallel tests start processes all the time, and a child holds a copy of every open file
+    /// for a moment before exec, locks included. So a freed lock can look held for a moment.
+    fn eventually(check: impl Fn() -> bool) -> bool {
+        (0..100).any(|_| {
+            check() || {
+                sleep(Duration::from_millis(10));
+                false
+            }
+        })
+    }
+
     fn json_body(reply: Reply) -> Value {
         serde_json::from_slice(&body(reply)).unwrap()
     }
@@ -3987,12 +4804,11 @@ mod tests {
 
         let running = api.run(3, Some(&run_json("running", json!([]))));
         let held = fs::File::create(running.join(RUN_LOCK)).unwrap();
-        held.try_lock().unwrap();
+        held.lock_shared().unwrap();
         assert_eq!(json_body(api.get("/v1/runs/3"))["status"], "running");
         drop(held);
-        assert_eq!(
-            json_body(api.get("/v1/runs/3"))["status"],
-            "interrupted",
+        assert!(
+            eventually(|| json_body(api.get("/v1/runs/3"))["status"] == "interrupted"),
             "session gone, lock free"
         );
         api.run(4, Some(&run_json("running", json!([]))));
@@ -4153,5 +4969,248 @@ mod tests {
         assert_eq!(detail["status"], "finished");
         assert_eq!(detail["session_video"], Value::Null);
         assert_eq!(json_body(api.get("/v1/runs"))["runs"][0]["bugs"], 1);
+    }
+
+    #[test]
+    fn reads_test_files() {
+        let base = Path::new("/tests");
+        let test = parse_test(r#"{"app": "com.example.shop", "goal": " Test the cart. "}"#, base).unwrap();
+        assert_eq!(test.app, "com.example.shop");
+        assert_eq!(test.goal, "Test the cart.");
+        assert_eq!(
+            (test.model.as_str(), test.max_minutes),
+            (DEFAULT_MODEL, DEFAULT_MAX_MINUTES)
+        );
+        assert!(test.apk.is_none() && test.avoid.is_empty() && test.login.is_none());
+
+        let full = r#"{"app": "com.x", "goal": "g", "apk": "build/app.apk", "avoid": ["Pay now"], "model": "haiku",
+            "max_minutes": 5, "login": {"user": "qa@example.com", "password_env": "SHOP_QA_PASSWORD"}}"#;
+        let test = parse_test(full, base).unwrap();
+        assert_eq!(
+            test.apk.as_deref(),
+            Some(Path::new("/tests/build/app.apk")),
+            "relative to the file"
+        );
+        assert_eq!(test.avoid, ["Pay now"]);
+        assert_eq!(
+            test.login,
+            Some(Login {
+                user: "qa@example.com".into(),
+                password_env: "SHOP_QA_PASSWORD".into()
+            })
+        );
+        let saved = test.to_json();
+        assert_eq!(saved["apk"], "app.apk", "no local paths in run.json");
+        assert_eq!(saved["login"]["password_env"], "SHOP_QA_PASSWORD");
+
+        for (bad, why) in [
+            ("[]", "must be a JSON object"),
+            ("{nope", "not valid JSON"),
+            (r#"{"goal": "g"}"#, "\"app\" is required"),
+            (r#"{"app": "com.x"}"#, "\"goal\" is required"),
+            (r#"{"app": "com.x", "goal": "  "}"#, "non-empty string"),
+            (r#"{"app": "com x", "goal": "g"}"#, "not a package name"),
+            (
+                r#"{"app": "com.x", "goal": "g", "modle": "haiku"}"#,
+                "unknown field \"modle\"",
+            ),
+            (r#"{"app": "com.x", "goal": "g", "model": "a b"}"#, "not a model name"),
+            (r#"{"app": "com.x", "goal": "g", "max_minutes": 0}"#, "from 1 to"),
+            (r#"{"app": "com.x", "goal": "g", "max_minutes": 2.5}"#, "whole number"),
+            (r#"{"app": "com.x", "goal": "g", "max_minutes": "5"}"#, "whole number"),
+            (
+                r#"{"app": "com.x", "goal": "g", "avoid": "Pay"}"#,
+                "list of button texts",
+            ),
+            (
+                r#"{"app": "com.x", "goal": "g", "avoid": ["Pay", ""]}"#,
+                "list of button texts",
+            ),
+            (r#"{"app": "com.x", "goal": "g", "login": "me"}"#, "must be an object"),
+            (
+                r#"{"app": "com.x", "goal": "g", "login": {"user": "u"}}"#,
+                "needs \"password_env\"",
+            ),
+            (
+                r#"{"app": "com.x", "goal": "g", "login": {"password_env": "P"}}"#,
+                "needs \"user\"",
+            ),
+            (
+                r#"{"app": "com.x", "goal": "g", "login": {"user": "u", "password_env": "P", "password": "x"}}"#,
+                "unknown field \"password\"",
+            ),
+            (
+                r#"{"app": "com.x", "goal": "g", "login": {"user": "u", "password_env": "hunter2!"}}"#,
+                "env var name",
+            ),
+            (
+                r#"{"app": "com.x", "goal": "g", "login": {"user": "ü", "password_env": "P"}}"#,
+                "printable ASCII",
+            ),
+        ] {
+            let error = parse_test(bad, base).unwrap_err();
+            assert!(error.contains(why), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn example_test_file_is_valid() {
+        let test = load_test(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/settings.json"
+        )))
+        .unwrap();
+        assert_eq!(
+            (test.name.as_str(), test.app.as_str()),
+            ("settings.json", "com.android.settings")
+        );
+    }
+
+    #[test]
+    fn test_prompt_has_the_rules_but_no_password() {
+        let mut test = parse_test(
+            r#"{"app": "com.x", "goal": "Check login.", "avoid": ["Pay now"], "login": {"user": "qa@x.com", "password_env": "PQA_PROMPT_PW"}}"#,
+            Path::new("."),
+        )
+        .unwrap();
+        let prompt = test.prompt();
+        for part in [
+            "com.x",
+            "Check login.",
+            "\"Pay now\"",
+            "\"qa@x.com\"",
+            "type_password",
+            "30 minutes",
+        ] {
+            assert!(prompt.contains(part), "{part}");
+        }
+        assert!(!prompt.contains("PQA_PROMPT_PW"), "the agent does not need the env var");
+        test.avoid.clear();
+        test.login = None;
+        let prompt = test.prompt();
+        assert!(!prompt.contains("Never press") && !prompt.contains("type_password"));
+    }
+
+    #[test]
+    fn avoid_list_blocks_taps_and_typing() {
+        let mut state = test_state();
+        state.elements = parse_screen(SAMPLE).1;
+        state.avoid = vec!["wi-fi".into(), "DARK".into()];
+        assert_eq!(
+            avoided(&state.avoid, "Network / Wi-Fi settings"),
+            Some("wi-fi"),
+            "ignores case"
+        );
+        assert_eq!(avoided(&state.avoid, "Bluetooth"), None);
+        let row = state.elements.iter().position(|e| e.label.contains("Wi")).unwrap() as i64 + 1;
+        let error = tap(&mut state, row).unwrap_err();
+        assert!(error.contains("refused") && error.contains("avoid list"), "{error}");
+        let switch = state.elements.iter().position(|e| e.label == "Dark mode").unwrap() as i64 + 1;
+        assert!(type_text(&mut state, switch, "x").unwrap_err().contains("refused"));
+        assert!(state.history.is_empty(), "refused actions are not in the history");
+    }
+
+    #[test]
+    fn type_password_only_types_into_password_fields() {
+        let mut state = test_state();
+        state.elements = parse_screen(SAMPLE).1;
+        let email = state.elements.iter().position(|e| e.rid == "email").unwrap() as i64 + 1;
+        assert!(
+            type_password(&mut state, email)
+                .unwrap_err()
+                .contains("no test password")
+        );
+
+        state.password_env = Some("PQA_TEST_PASSWORD_MISSING".into());
+        assert!(type_password(&mut state, email).unwrap_err().contains("is not set"));
+
+        // SAFETY: tests use their own variable names; nothing else reads them.
+        unsafe { std::env::set_var("PQA_TEST_PASSWORD_A", "s3cret-pw") };
+        state.password_env = Some("PQA_TEST_PASSWORD_A".into());
+        let error = type_password(&mut state, email).unwrap_err();
+        assert!(
+            error.contains("not a password field") && !error.contains("s3cret"),
+            "{error}"
+        );
+
+        unsafe { std::env::set_var("PQA_TEST_PASSWORD_B", "pässword") };
+        state.password_env = Some("PQA_TEST_PASSWORD_B".into());
+        let error = type_password(&mut state, email).unwrap_err();
+        assert!(!error.contains('ä'), "never quote the password: {error}");
+        assert!(state.history.is_empty());
+    }
+
+    #[test]
+    fn hides_the_test_password_in_output() {
+        let mut state = test_state();
+        assert_eq!(redact(&state, "no password set".into()), "no password set");
+        // SAFETY: tests use their own variable names; nothing else reads them.
+        unsafe { std::env::set_var("PQA_TEST_PASSWORD_C", "hunter22") };
+        unsafe { std::env::set_var("PQA_TEST_PASSWORD_D", "abc") };
+        state.password_env = Some("PQA_TEST_PASSWORD_C".into());
+        assert_eq!(
+            redact(&state, "[2] EditText \"hunter22\" edit".into()),
+            "[2] EditText \"(hidden)\" edit"
+        );
+        state.password_env = Some("PQA_TEST_PASSWORD_D".into());
+        assert_eq!(
+            redact(&state, "abc is too short to hide".into()),
+            "abc is too short to hide"
+        );
+    }
+
+    #[test]
+    fn run_folder_is_shared_by_run_and_session() {
+        let api = Api::new("adopt");
+        let test = parse_test(
+            r#"{"app": "com.x", "goal": "Check it.", "avoid": ["Pay now"], "login": {"user": "u", "password_env": "PQA_ADOPT_PW"}}"#,
+            Path::new("."),
+        )
+        .unwrap();
+        let mut made = create_run(&api.reports, test.to_json()).unwrap();
+        let header = fs::read_to_string(made.dir.join("report.md")).unwrap();
+        assert!(header.contains("- App: com.x\n") && header.contains("- Goal: Check it.\n"));
+        assert_eq!(
+            json_body(api.get("/v1/runs/1"))["status"],
+            "running",
+            "run holds the lock"
+        );
+
+        let mut state = State::new(api.reports.clone());
+        state.video_checked = true;
+        state.run_dir = Some(made.dir.clone());
+        assert_eq!(report_dir(&mut state).unwrap(), made.dir, "no new folder");
+        assert_eq!(state.avoid, ["Pay now"]);
+        assert_eq!(state.password_env.as_deref(), Some("PQA_ADOPT_PW"));
+        made.lock = None;
+        assert_eq!(
+            json_body(api.get("/v1/runs/1"))["status"],
+            "running",
+            "the session holds it too"
+        );
+
+        let bug = Bug {
+            title: "Cart is empty".into(),
+            severity: "high".into(),
+            package: "com.x".into(),
+            body: "b".into(),
+        };
+        save_bug(&mut state, &bug, "").unwrap();
+        finish_session(&mut state);
+        assert!(eventually(|| !run_is_active(&made.dir)));
+        let detail = json_body(api.get("/v1/runs/1"));
+        assert_eq!(detail["status"], "finished");
+        assert_eq!(detail["bugs"][0]["title"], "Cart is empty");
+        assert_eq!(
+            detail["test"]["goal"], "Check it.",
+            "the session keeps the test settings"
+        );
+        assert!(detail.get("agent").is_none());
+        assert_eq!(next_run_number(&api.reports), 2);
+
+        let mut lost = State::new(api.reports.clone());
+        lost.run_dir = Some(api.reports.join("run-009"));
+        let reply = call_tool(&mut lost, &json!({"name": "back", "arguments": {}}));
+        assert_eq!(reply["isError"], true, "no folder, no actions");
     }
 }

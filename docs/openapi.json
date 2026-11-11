@@ -101,7 +101,39 @@
           "bugs": { "type": "array", "items": { "$ref": "#/components/schemas/Bug" } },
           "session_video": { "type": ["string", "null"], "description": "`session.mp4` once the session has ended, if video was on." },
           "files": { "type": "array", "items": { "type": "string" }, "description": "Every file in the run folder, for example `report.md` and `video/part-001.mp4`." },
-          "error": { "type": "string", "description": "Only for status `broken`." }
+          "error": { "type": "string", "description": "Only for status `broken`." },
+          "test": { "$ref": "#/components/schemas/Test" },
+          "agent": { "$ref": "#/components/schemas/Agent" }
+        }
+      },
+      "Test": {
+        "type": "object",
+        "description": "Only for runs started by `phantomqa run`: the test file's settings. Never the password.",
+        "properties": {
+          "file": { "type": "string" },
+          "app": { "type": "string" },
+          "goal": { "type": "string" },
+          "avoid": { "type": "array", "items": { "type": "string" } },
+          "model": { "type": "string" },
+          "max_minutes": { "type": "integer" },
+          "apk": { "type": "string", "description": "File name only." },
+          "login": {
+            "type": "object",
+            "properties": { "user": { "type": "string" }, "password_env": { "type": "string", "description": "The env var name, not the password." } }
+          }
+        }
+      },
+      "Agent": {
+        "type": "object",
+        "description": "Only for runs started by `phantomqa run`, once the run is over.",
+        "properties": {
+          "name": { "type": "string" },
+          "model": { "type": "string" },
+          "ended": { "type": "string", "enum": ["done", "time limit", "error"] },
+          "summary": { "type": "string", "description": "The agent's own summary of the test." },
+          "cost_usd": { "type": ["number", "null"] },
+          "turns": { "type": ["integer", "null"] },
+          "error": { "type": ["string", "null"] }
         }
       }
     },

@@ -12,6 +12,7 @@ PhantomQA is one small Rust binary. It lets an AI agent (for example Claude Code
 | `adb` from [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) | yes | talks to the device |
 | An Android emulator or phone with USB debugging | yes | the app under test runs here |
 | [ffmpeg](https://ffmpeg.org) | no | joins video parts into one clip per bug and `session.mp4` |
+| [Claude Code](https://claude.com/claude-code) | for `run` | the agent that does the testing in `phantomqa run` |
 
 Check your setup:
 
@@ -50,6 +51,7 @@ Tools the agent gets:
 | `screen` | read the screen as a numbered list |
 | `tap` | tap element N |
 | `type_text` | tap element N and type text |
+| `type_password` | type the test account password into password field N; the agent never sees it |
 | `back` | press the back button |
 | `crashes` | check for new crashes and ANRs |
 | `report_bug` | save a bug: title, steps, expected, actual, severity |
@@ -62,6 +64,45 @@ app: com.android.settings
 [2] LinearLayout "Network & internet / Mobile, Wi‑Fi, hotspot" click
 [3] RecyclerView #recycler_view scroll
 ```
+
+## Run a test by itself
+
+Describe the test in a JSON file, then let PhantomQA run it from start to end:
+
+```json
+{
+  "app": "com.example.shop",
+  "apk": "build/app-debug.apk",
+  "goal": "Test sign up, login, search and the cart.",
+  "avoid": ["Delete account", "Pay now"],
+  "login": {"user": "qa@example.com", "password_env": "SHOP_QA_PASSWORD"},
+  "model": "haiku",
+  "max_minutes": 20
+}
+```
+
+```sh
+export SHOP_QA_PASSWORD='...'      # the test account's password
+phantomqa run shop.json
+```
+
+| Field | Needed | Meaning |
+|---|---|---|
+| `app` | yes | package name of the app to test |
+| `goal` | yes | what to test, in plain words |
+| `apk` | no | install this file first (relative to the test file) |
+| `avoid` | no | button texts the agent must never press. PhantomQA refuses them, ignoring case |
+| `login` | no | a test account for the app's own login screen. `password_env` names the env var with the password; the password is never in the file |
+| `model` | no | Claude model: `haiku`, `sonnet` (default) or `opus` |
+| `max_minutes` | no | stop the agent after this long (default 30) |
+
+- `run` checks everything first: the file (unknown fields are errors), the password env var, Claude Code, the device, and the app (it installs `apk` if set).
+- It starts Claude Code with PhantomQA as its only tools: no shell, no files, and none of your own Claude Code settings or hooks.
+- The agent types the user name itself, and calls `type_password` for the password field. PhantomQA types the password, only into fields marked as password fields, and hides it in everything the agent and the report see.
+- The run folder gets everything a normal session gets, plus an `## Agent` part in `report.md`: the model, how it ended, the cost and the agent's summary.
+- Exit code: `0` no bugs, `1` bugs found, `2` the run failed. So it fits CI and cron.
+- One run per device at a time; a second run on the same device stops with "busy".
+- Try it on any emulator with [examples/settings.json](examples/settings.json).
 
 ## Use by hand
 
@@ -100,7 +141,8 @@ In an MCP session, PhantomQA records the screen with `screenrecord` in 30-second
 - Without ffmpeg, a clip of one part is still made. Clips that need two parts, and the session, stay as parts in `video/`, linked from the report.
 - Android only records a frame when the screen changes, so still moments are shorter in the video than in real time.
 - Screens that block screenshots (some banking apps, password screens) record as black.
-- If PhantomQA is killed instead of closed, `session.mp4` is not made; the parts stay in `video/`.
+- Agents kill their MCP server right after they exit. The session runs in a separate process that is not hit by that, so it still finishes: the last part, `session.mp4` and `run.json`.
+- If PhantomQA itself is killed, `session.mp4` is not made; the parts stay in `video/`.
 - Turn video off with `--no-video`, screenshots with `--no-screenshots`.
 
 ## HTTP API
@@ -154,6 +196,7 @@ Put options before the command. Each option also has an env var, which is handy 
 | `--no-video` | `PHANTOMQA_VIDEO=0` | video on |
 | `--no-screenshots` | `PHANTOMQA_SCREENSHOTS=0` | screenshots on |
 | `--tokens PATH` | `PHANTOMQA_TOKENS` | `tokens.json` |
+| `--claude PATH` | `PHANTOMQA_CLAUDE` | `claude` on PATH |
 
 Example: `phantomqa --serial emulator-5554 --reports ~/qa --no-video mcp`
 

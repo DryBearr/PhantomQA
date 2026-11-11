@@ -94,6 +94,14 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7070/v1/runs/3
 | `unknown` | the run has no `run.json` (made by an older version) |
 | `broken` | `run.json` cannot be read; `error` says why |
 
+Runs started by `phantomqa run` also have `test` (the test file's settings: `file`, `app`, `goal`, `avoid`, `model`, `max_minutes`, and `apk` and `login` when set, never the password) and `agent`:
+
+```json
+"agent": {"name": "claude", "model": "haiku", "ended": "done", "summary": "I opened ...", "cost_usd": 0.003, "turns": 12, "error": null}
+```
+
+`ended` is `done`, `time limit` or `error`; `error` says why. `agent` appears when the run is over.
+
 A bug's `files` lists only the files that exist. When no single video clip could be made (no ffmpeg), the bug has `video_parts`, such as `["video/part-003.mp4", "video/part-004.mp4"]`, instead of `video`.
 
 ### Files

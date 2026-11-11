@@ -1,0 +1,7 @@
+{
+  "app": "com.android.settings",
+  "goal": "Open Settings. Look at the Display page and the Battery page, then go back. Report anything that looks broken.",
+  "avoid": ["Reset", "Erase"],
+  "model": "haiku",
+  "max_minutes": 5
+}
