@@ -50,8 +50,13 @@ Tools the agent gets:
 | `launch_app` | start an installed app by package name |
 | `screen` | read the screen as a numbered list |
 | `tap` | tap element N |
-| `type_text` | tap element N and type text |
+| `type_text` | tap element N and type text, in any language and with emoji; with `clear`, replace what the field holds |
 | `type_password` | type the test account password into password field N; the agent never sees it |
+| `scroll` | swipe down, up, left or right in a list or page; says when the end is reached |
+| `long_press` | press and hold element N, for context menus |
+| `press_key` | enter, delete, tab or home |
+| `look` | a screenshot, for screens the element list cannot describe: games, maps, custom drawing |
+| `tap_at` | tap a point, in percent of the screen, for apps that draw their own UI |
 | `back` | press the back button |
 | `crashes` | check for new crashes and ANRs |
 | `report_bug` | save a bug: title, steps, expected, actual, severity |
@@ -92,9 +97,11 @@ phantomqa run shop.json
 | `goal` | yes | what to test, in plain words |
 | `apk` | no | install this file first (relative to the test file) |
 | `avoid` | no | button texts the agent must never press. PhantomQA refuses them, ignoring case |
-| `login` | no | a test account for the app's own login screen. `password_env` names the env var with the password; the password is never in the file |
+| `login` | no | a test account for the app's own login screen. `password_env` names the env var with the password; the password is never in the file, and must be printable ASCII |
 | `model` | no | Claude model: `haiku`, `sonnet` (default) or `opus` |
 | `max_minutes` | no | stop the agent after this long (default 30) |
+| `clear_data` | no | `true`: clear the app's data before the test, like a fresh install (logged out, settings gone) |
+| `snapshot` | no | load this emulator snapshot before the test, so every run starts from the same device state |
 
 - `run` checks everything first: the file (unknown fields are errors), the password env var, Claude Code, the device, and the app (it installs `apk` if set).
 - It starts Claude Code with PhantomQA as its only tools: no shell, no files, and none of your own Claude Code settings or hooks.
@@ -102,6 +109,7 @@ phantomqa run shop.json
 - The run folder gets everything a normal session gets, plus an `## Agent` part in `report.md`: the model, how it ended, the cost and the agent's summary.
 - Exit code: `0` no bugs, `1` bugs found, `2` the run failed. So it fits CI and cron.
 - One run per device at a time; a second run on the same device stops with "busy".
+- `snapshot` works on emulators only. Save one once, with the device the way each test should start: `adb emu avd snapshot save clean`. Then set `"snapshot": "clean"`. On a phone, use `clear_data` instead.
 - Try it on any emulator with [examples/settings.json](examples/settings.json).
 
 ## Run tests on a schedule
@@ -151,6 +159,10 @@ phantomqa launch com.android.settings   # start an app, print its screen
 phantomqa screen                        # print the current screen
 phantomqa tap 3                         # tap element [3]
 phantomqa type 2 hello world            # tap element [2] and type text
+phantomqa scroll down                   # scroll the biggest list; also up, left, right, or `scroll down 3`
+phantomqa long-press 4                  # press and hold element [4]
+phantomqa key enter                     # enter, delete, tab or home; `key delete 5` presses it 5 times
+phantomqa tap-at 50 30                  # tap a point, in percent of the screen
 phantomqa back                          # press back
 phantomqa crashes                       # list crashes and ANRs in the device's crash log
 ```
@@ -184,6 +196,23 @@ In an MCP session, PhantomQA records the screen with `screenrecord` in 30-second
 - Agents kill their MCP server right after they exit. The session runs in a separate process that is not hit by that, so it still finishes: the last part, `session.mp4` and `run.json`.
 - If PhantomQA itself is killed, `session.mp4` is not made; the parts stay in `video/`.
 - Turn video off with `--no-video`, screenshots with `--no-screenshots`.
+
+## Device helper
+
+PhantomQA copies a small helper (6 KB) to the device, to read the screen and type faster:
+
+- It reads the screen in about 0.3 s, where `uiautomator dump` takes 2 s. An action and its new screen take about 0.5 to 1.5 s.
+- It types any text: accents, other scripts and emoji. `input text` types only ASCII.
+- It knows where the on-screen keyboard is. PhantomQA then refuses taps on what the keyboard covers, which would press keys instead, and keeps scrolls above it. The screen list says when the keyboard is open.
+
+It is safe to leave on:
+
+- It runs over adb as the shell user, like `uiautomator`. It installs no app, opens no port and asks for no permission.
+- It talks to PhantomQA only through that adb connection, and stops when the session ends.
+- It is one file you can read: [helper/Helper.java](helper/Helper.java). The built `helper/phantomqa-helper.jar` is in the repo and inside the binary, so you need no Java. Rebuild it after a change with `ANDROID_HOME=/path/to/sdk helper/build.sh`; that needs a JDK and the Android SDK.
+- It lives in `/data/local/tmp/phantomqa-helper-*.jar`. A new version replaces the old one, and a broken copy is replaced on its own.
+
+If it cannot run, or stops working, PhantomQA reads the screen with `uiautomator dump` and types with `input text`, which only take printable ASCII. `doctor` shows if it works. Turn it off with `--no-helper` or `PHANTOMQA_HELPER=0`.
 
 ## HTTP API
 
@@ -235,6 +264,7 @@ Put options before the command. Each option also has an env var, which is handy 
 | `--ffmpeg PATH` | `FFMPEG` | `ffmpeg` on PATH |
 | `--no-video` | `PHANTOMQA_VIDEO=0` | video on |
 | `--no-screenshots` | `PHANTOMQA_SCREENSHOTS=0` | screenshots on |
+| `--no-helper` | `PHANTOMQA_HELPER=0` | device helper on |
 | `--tokens PATH` | `PHANTOMQA_TOKENS` | `tokens.json` |
 | `--claude PATH` | `PHANTOMQA_CLAUDE` | `claude` on PATH |
 | `--routines PATH` | `PHANTOMQA_ROUTINES` | `routines.json` |
@@ -243,10 +273,9 @@ Example: `phantomqa --serial emulator-5554 --reports ~/qa --no-video mcp`
 
 ## Limits
 
-- `type_text` types printable ASCII only.
-- No swipe or scroll yet, so long lists can only be tested as far as they show.
-- Apps that draw their own UI (games, Flutter without semantics) show few or no elements.
-- Reading the screen with `uiautomator dump` takes about 1-3 seconds.
+- Apps that draw their own UI (games, Flutter without semantics) show few or no elements. The agent uses `look` and `tap_at` there, and the avoid list cannot protect buttons that are only drawn.
+- Without the device helper: each action takes about 3 seconds, typing is printable ASCII only, and PhantomQA cannot tell what the keyboard covers.
+- Text typed through the helper goes in like a paste, not key by key. Non-ASCII text cannot go into password fields.
 
 ## License
 

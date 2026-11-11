@@ -94,7 +94,7 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7070/v1/runs/3
 | `unknown` | the run has no `run.json` (made by an older version) |
 | `broken` | `run.json` cannot be read; `error` says why |
 
-Runs started by `phantomqa run` or a routine also have `test` (the test file's settings: `file`, `app`, `goal`, `avoid`, `model`, `max_minutes`, and `apk` and `login` when set, never the password; `routine` is the routine's name when a routine started the run) and `agent`:
+Runs started by `phantomqa run` or a routine also have `test` (the test file's settings: `file`, `app`, `goal`, `avoid`, `model`, `max_minutes`, and `apk`, `login`, `clear_data` and `snapshot` when set, never the password; `routine` is the routine's name when a routine started the run) and `agent`:
 
 ```json
 "agent": {"name": "claude", "model": "haiku", "ended": "done", "summary": "I opened ...", "cost_usd": 0.003, "turns": 12, "error": null}

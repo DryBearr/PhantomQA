@@ -1,5 +1,6 @@
 # Build output
 /target/
+/helper/build/
 
 # Test reports (screenshots, logs, videos)
 /reports/

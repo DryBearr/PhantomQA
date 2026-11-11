@@ -18,7 +18,7 @@ use std::thread::{JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
 /// How long to wait after an action before reading the screen again.
-const SETTLE: Duration = Duration::from_millis(500);
+const SETTLE: Duration = Duration::from_millis(150);
 /// An adb command that runs longer than this is killed.
 const ADB_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longer labels are cut, to keep the screen list small.
@@ -36,7 +36,22 @@ struct Element {
     label: String,
     rid: String,
     flags: Vec<&'static str>,
-    center: (i32, i32),
+    /// (left, top, right, bottom) in screen pixels.
+    bounds: (i32, i32, i32, i32),
+    /// Characters in the element's text, for clearing a field.
+    text_len: usize,
+}
+
+impl Element {
+    fn center(&self) -> (i32, i32) {
+        let (l, t, r, b) = self.bounds;
+        ((l + r) / 2, (t + b) / 2)
+    }
+
+    fn contains(&self, (x, y): (i32, i32)) -> bool {
+        let (l, t, r, b) = self.bounds;
+        (l..r).contains(&x) && (t..b).contains(&y)
+    }
 }
 
 /// Everything the server remembers between tool calls.
@@ -70,6 +85,17 @@ struct State {
     avoid: Vec<String>,
     /// Env var with the test account password, for type_password.
     password_env: Option<String>,
+    /// Screen rotation of the last screen read: 0 to 3, a quarter turn each.
+    rotation: u8,
+    /// The display size in pixels, unturned, read once.
+    display: Option<(i32, i32)>,
+    /// Where the on-screen keyboard was on the last screen read, if open. Only the helper knows.
+    keyboard: Option<(i32, i32, i32, i32)>,
+    /// The device helper, started on first use.
+    helper: Option<Helper>,
+    /// Why the helper is not used. Then `uiautomator dump` reads the screen, and typing is ASCII only.
+    helper_off: Option<String>,
+    helper_starts: usize,
 }
 
 struct Report {
@@ -106,6 +132,12 @@ impl State {
             run_dir: None,
             avoid: Vec::new(),
             password_env: None,
+            rotation: 0,
+            display: None,
+            keyboard: None,
+            helper: None,
+            helper_off: None,
+            helper_starts: 0,
         }
     }
 
@@ -128,6 +160,8 @@ struct Config {
     reports: PathBuf,
     video: bool,
     screenshots: bool,
+    /// Use the device helper to read the screen and type; else `uiautomator dump` and `input text`.
+    helper: bool,
     /// None means adb picks the device (it reads ANDROID_SERIAL itself).
     serial: Option<String>,
     /// tokens.json: the hashed API tokens.
@@ -152,7 +186,7 @@ fn env_var(name: &str) -> Option<String> {
 fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<(Config, usize), String> {
     let (mut adb, mut ffmpeg, mut reports, mut serial, mut tokens, mut claude, mut routines) =
         (None, None, None, None, None, None, None);
-    let (mut no_video, mut no_screenshots) = (false, false);
+    let (mut no_video, mut no_screenshots, mut no_helper) = (false, false, false);
     let mut i = 0;
     while let Some(arg) = args.get(i).filter(|a| a.starts_with("--")) {
         i += 1;
@@ -165,7 +199,13 @@ fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<
             None => (arg.as_str(), None),
         };
         match name {
-            "--no-video" | "--no-screenshots" if inline.is_some() => return Err(format!("{name} takes no value")),
+            "--no-video" | "--no-screenshots" | "--no-helper" if inline.is_some() => {
+                return Err(format!("{name} takes no value"));
+            }
+            "--no-helper" => {
+                no_helper = true;
+                continue;
+            }
             "--no-video" => {
                 no_video = true;
                 continue;
@@ -219,6 +259,7 @@ fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<
         },
         video: !no_video && env("PHANTOMQA_VIDEO").is_none_or(|v| v != "0"),
         screenshots: !no_screenshots && env("PHANTOMQA_SCREENSHOTS").is_none_or(|v| v != "0"),
+        helper: !no_helper && env("PHANTOMQA_HELPER").is_none_or(|v| v != "0"),
         serial,
         tokens: {
             let tokens = PathBuf::from(
@@ -431,6 +472,243 @@ fn extract_hierarchy(out: &str) -> Option<String> {
         None => out[start..].find("/>")? + start + 2,
     };
     (start < end).then(|| out[start..end].to_string())
+}
+
+// ---------------------------------------------------------------- device helper
+//
+// helper/Helper.java, built into helper/phantomqa-helper.jar by helper/build.sh. It reads the
+// screen in about 0.3 s, where `uiautomator dump` takes 2 s, and types text `input text` cannot,
+// like accents, other scripts and emoji. It runs over adb as the shell user, installs nothing,
+// opens no port, and stops with the session. When it cannot run, PhantomQA uses
+// `uiautomator dump` and `input text` instead.
+
+const HELPER_JAR: &[u8] = include_bytes!("../helper/phantomqa-helper.jar");
+/// Helper.VERSION in Helper.java.
+const HELPER_VERSION: u64 = 2;
+/// The first start on a device also copies the helper there.
+const HELPER_START_TIMEOUT: Duration = Duration::from_secs(20);
+/// A screen read waits up to 3 s for the screen to settle, so this leaves plenty.
+const HELPER_TIMEOUT: Duration = Duration::from_secs(15);
+/// After this many starts in one session, the helper stays off.
+const MAX_HELPER_STARTS: usize = 3;
+
+/// The helper process: `adb shell app_process ...`, one JSON line each way per request.
+struct Helper {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    replies: mpsc::Receiver<String>,
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        // Closing stdin ends the helper on the device; killing adb makes sure.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+enum HelperError {
+    /// It stopped, hung or sent nonsense: start it again next time.
+    Broken(String),
+    /// It answered with an error, like "no text field has the focus".
+    Refused(String),
+}
+
+impl Helper {
+    /// Helper.java says the same version as HELPER_VERSION.
+    #[cfg(test)]
+    fn java_version_matches() -> bool {
+        include_str!("../helper/Helper.java").contains(&format!("static final int VERSION = {HELPER_VERSION};"))
+    }
+
+    fn reply(&mut self, timeout: Duration) -> Result<Value, HelperError> {
+        let line = self.replies.recv_timeout(timeout).map_err(|e| {
+            HelperError::Broken(match e {
+                mpsc::RecvTimeoutError::Timeout => "the device helper did not answer in time".into(),
+                mpsc::RecvTimeoutError::Disconnected => "the device helper stopped".into(),
+            })
+        })?;
+        let reply: Value = serde_json::from_str(&line)
+            .map_err(|e| HelperError::Broken(format!("the device helper sent a broken reply: {e}")))?;
+        if reply["ok"] == true {
+            Ok(reply)
+        } else {
+            let error = reply["error"].as_str().unwrap_or("unknown error");
+            Err(HelperError::Refused(one_line(error, 300)))
+        }
+    }
+
+    fn ask(&mut self, request: &Value) -> Result<Value, HelperError> {
+        writeln!(self.stdin, "{request}")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|e| HelperError::Broken(format!("the device helper stopped: {e}")))?;
+        self.reply(HELPER_TIMEOUT)
+    }
+}
+
+/// Where the helper lives on the device. The name changes with the jar, so a new version is
+/// copied over once and an old one never runs.
+fn helper_path() -> String {
+    use sha2::Digest;
+    let hash = hex(&sha2::Sha256::digest(HELPER_JAR));
+    format!("{DEVICE_TMP}/phantomqa-helper-{}.jar", &hash[..12])
+}
+
+fn start_helper() -> Result<Helper, String> {
+    let path = helper_path();
+    let present = adb(&["shell", &format!("[ -f {path} ] && echo present")]).is_ok_and(|out| out.contains("present"));
+    if present {
+        match launch_helper(&path) {
+            Ok(helper) => return Ok(helper),
+            // A file left broken on the device, say by a copy cut short: copy it again, once.
+            Err(e) => warn(&format!("the device helper did not start ({e}); copying it again")),
+        }
+    }
+    push_helper(&path)?;
+    launch_helper(&path)
+}
+
+fn push_helper(path: &str) -> Result<(), String> {
+    let local = std::env::temp_dir().join(format!("phantomqa-helper-{}.jar", std::process::id()));
+    fs::write(&local, HELPER_JAR).map_err(|e| format!("cannot write {}: {e}", local.display()))?;
+    // Copy to a temporary name, then rename: a helper starting at the same moment never sees
+    // half a file. Old versions go at the same time.
+    let partial = format!("{path}.{}.part", std::process::id());
+    let pushed = adb(&["push", &local.to_string_lossy(), &partial]).and_then(|_| {
+        adb(&[
+            "shell",
+            &format!("rm -f {DEVICE_TMP}/phantomqa-helper-*.jar && mv -f {partial} {path}"),
+        ])
+    });
+    let _ = fs::remove_file(&local);
+    pushed.map(|_| ()).map_err(|e| {
+        let _ = adb(&["shell", &format!("rm -f {partial}")]);
+        format!("cannot copy the helper to the device: {e}")
+    })
+}
+
+fn launch_helper(path: &str) -> Result<Helper, String> {
+    let mut child = adb_command()
+        .args([
+            "shell",
+            &format!("CLASSPATH={path} exec app_process /system/bin phantomqa.Helper"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(adb_missing)?;
+    let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("cannot talk to the device helper".into());
+    };
+    let (sender, replies) = mpsc::channel();
+    // Old devices mix error output into stdout; replies are the lines that start with "PQA ".
+    // Other lines are kept, to say why the helper did not start.
+    let errors = Arc::new(Mutex::new(String::new()));
+    let keep = |errors: &Arc<Mutex<String>>, line: &str| {
+        let mut errors = errors.lock().unwrap_or_else(|e| e.into_inner());
+        if errors.len() < 2000 && !line.trim().is_empty() {
+            errors.push_str(line.trim());
+            errors.push(' ');
+        }
+    };
+    {
+        let errors = errors.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                match line.trim_end_matches('\r').strip_prefix("PQA ") {
+                    Some(reply) => {
+                        if sender.send(reply.to_string()).is_err() {
+                            break;
+                        }
+                    }
+                    None => keep(&errors, &line),
+                }
+            }
+        });
+    }
+    {
+        let errors = errors.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                keep(&errors, &line);
+            }
+        });
+    }
+    let mut helper = Helper { child, stdin, replies };
+    let ready = helper.reply(HELPER_START_TIMEOUT).map_err(|e| {
+        let e = match e {
+            HelperError::Broken(e) | HelperError::Refused(e) => e,
+        };
+        // The error output may still be on its way.
+        sleep(Duration::from_millis(200));
+        let errors = errors.lock().unwrap_or_else(|e| e.into_inner());
+        if errors.is_empty() {
+            e
+        } else {
+            format!("{e}: {}", one_line(&errors, 300))
+        }
+    })?;
+    if ready["version"].as_u64() != Some(HELPER_VERSION) {
+        return Err(format!(
+            "the device helper is version {}, not {HELPER_VERSION}",
+            ready["version"]
+        ));
+    }
+    Ok(helper)
+}
+
+/// The running helper, started on first use. None when it is off or cannot run.
+fn helper(state: &mut State) -> Option<&mut Helper> {
+    if state.helper.is_none() && state.helper_off.is_none() {
+        if !config().helper {
+            state.helper_off = Some("it is turned off (--no-helper or PHANTOMQA_HELPER=0)".into());
+        } else if state.helper_starts >= MAX_HELPER_STARTS {
+            state.helper_off = Some("it stopped working too often".into());
+            warn("the device helper stopped working too often; reading the screen the slower way");
+        } else {
+            state.helper_starts += 1;
+            match start_helper() {
+                Ok(helper) => state.helper = Some(helper),
+                Err(e) => {
+                    warn(&format!(
+                        "the device helper does not run ({e}); reading the screen the slower way"
+                    ));
+                    state.helper_off = Some(e);
+                }
+            }
+        }
+    }
+    state.helper.as_mut()
+}
+
+/// Asks the helper. A broken helper is dropped, and starts again on the next request.
+fn ask_helper(state: &mut State, request: &Value) -> Result<Value, String> {
+    let Some(helper) = helper(state) else {
+        return Err(state.helper_off.clone().unwrap_or_default());
+    };
+    match helper.ask(request) {
+        Ok(reply) => Ok(reply),
+        Err(HelperError::Refused(e)) => Err(e),
+        Err(HelperError::Broken(e)) => {
+            state.helper = None;
+            Err(e)
+        }
+    }
+}
+
+/// The screen's XML: from the helper when it runs, else from `uiautomator dump`.
+fn screen_xml(state: &mut State) -> Result<String, String> {
+    if let Ok(reply) = ask_helper(state, &json!({"cmd": "dump"}))
+        && let Some(xml) = reply["xml"].as_str().and_then(extract_hierarchy)
+    {
+        return Ok(xml);
+    }
+    dump_xml()
 }
 
 // ---------------------------------------------------------------- screen parsing
@@ -664,7 +942,8 @@ fn parse_screen(xml: &str) -> (String, Vec<Element>) {
             label: shorten(&label),
             rid: rid.rsplit('/').next().unwrap_or(rid).to_string(),
             flags,
-            center: ((l + r) / 2, (t + b) / 2),
+            bounds: (l, t, r, b),
+            text_len: node.get("text").chars().count(),
         });
     }
     (package, elements)
@@ -696,12 +975,71 @@ fn render_screen(package: &str, elements: &[Element]) -> String {
 // ---------------------------------------------------------------- actions
 
 fn read_screen(state: &mut State) -> Result<String, String> {
-    let xml = dump_xml()?;
+    let xml = screen_xml(state)?;
     let (package, elements) = parse_screen(&xml);
     let text = render_screen(&package, &elements);
     state.elements = elements;
     state.package = package;
+    state.rotation = hierarchy_rotation(&xml);
+    state.keyboard = hierarchy_keyboard(&xml);
+    if state.keyboard.is_some() {
+        return Ok(format!(
+            "{text}(the keyboard is open over the bottom of the screen; elements under it cannot be touched until back closes it)\n"
+        ));
+    }
     Ok(text)
+}
+
+/// The `keyboard="[l,t][r,b]"` the helper adds to `<hierarchy>` while the keyboard is open.
+fn hierarchy_keyboard(xml: &str) -> Option<(i32, i32, i32, i32)> {
+    let tag = &xml[xml.find("<hierarchy")?..];
+    let tag = &tag[..tag.find('>')?];
+    let value = &tag[tag.find("keyboard=\"")? + 10..];
+    parse_bounds(&value[..value.find('"')?]).filter(|(l, t, r, b)| r > l && b > t)
+}
+
+/// Refuses a touch on what the keyboard covers: it would press a key instead.
+fn not_under_keyboard(state: &State, point: (i32, i32), what: &str) -> Result<(), String> {
+    match state.keyboard {
+        Some((l, t, r, b)) if (l..r).contains(&point.0) && (t..b).contains(&point.1) => Err(format!(
+            "{what} is under the keyboard. Press back to close the keyboard, or scroll, then try again."
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Is the keyboard open? From the helper's screen read, else asked from the input method service.
+fn keyboard_open(state: &State) -> bool {
+    state.keyboard.is_some()
+        || (state.helper.is_none()
+            && adb(&["shell", "dumpsys", "input_method"]).is_ok_and(|out| out.contains("mInputShown=true")))
+}
+
+/// The `rotation` of `<hierarchy rotation="1">`: 0 to 3.
+fn hierarchy_rotation(xml: &str) -> u8 {
+    xml.find("rotation=\"")
+        .and_then(|i| xml[i + 10..].chars().next())
+        .and_then(|c| c.to_digit(10))
+        .map_or(0, |n| (n % 4) as u8)
+}
+
+/// "Physical size: 1080x2400", maybe followed by "Override size: 720x1600", which wins.
+fn parse_wm_size(out: &str) -> Option<(i32, i32)> {
+    out.lines()
+        .filter_map(|line| {
+            let (w, h) = line.split(':').nth(1)?.trim().split_once('x')?;
+            Some((w.parse().ok()?, h.parse().ok()?))
+        })
+        .rfind(|&(w, h): &(i32, i32)| w > 0 && h > 0)
+}
+
+/// The screen size in pixels, as the screen is turned now.
+fn screen_size(state: &mut State) -> Result<(i32, i32), String> {
+    if state.display.is_none() {
+        state.display = parse_wm_size(&adb(&["shell", "wm", "size"])?);
+    }
+    let (w, h) = state.display.ok_or("cannot read the screen size (adb shell wm size)")?;
+    Ok(if state.rotation % 2 == 1 { (h, w) } else { (w, h) })
 }
 
 /// Short description of an element for the action history, e.g. `[3] Button "Log in"`.
@@ -752,8 +1090,9 @@ fn pressable(state: &State, id: i64) -> Result<Element, String> {
 
 fn tap(state: &mut State, id: i64) -> Result<String, String> {
     let e = pressable(state, id)?;
+    not_under_keyboard(state, e.center(), &format!("[{id}]"))?;
     state.remember(format!("tap {}", describe(id, &e)));
-    let (x, y) = e.center;
+    let (x, y) = e.center();
     adb(&["shell", "input", "tap", &x.to_string(), &y.to_string()])?;
     sleep(SETTLE);
     read_screen(state)
@@ -766,7 +1105,7 @@ fn input_text_args(text: &str) -> Result<Vec<String>, String> {
         return Err("text is empty".into());
     }
     if let Some(c) = text.chars().find(|c| !c.is_ascii() || c.is_ascii_control()) {
-        return Err(format!("cannot type {c:?}: only printable ASCII is supported for now"));
+        return Err(format!("cannot type {c:?} this way: only printable ASCII"));
     }
     let mut chunks = Vec::new();
     let mut current = String::new();
@@ -783,25 +1122,98 @@ fn input_text_args(text: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn type_text(state: &mut State, id: i64, text: &str) -> Result<String, String> {
-    type_into(state, id, text, "type_text")
+/// Taps field [id] and types `text`. With `clear`, deletes the field's text first; then the text
+/// may be empty, to leave the field empty.
+fn type_text(state: &mut State, id: i64, text: &str, clear: bool) -> Result<String, String> {
+    if text.is_empty() && !clear {
+        return Err("text is empty. To empty the field, send clear: true with empty text.".into());
+    }
+    type_into(state, id, text, clear, "type_text")
 }
 
-fn type_into(state: &mut State, id: i64, text: &str, action: &str) -> Result<String, String> {
-    let args = input_text_args(text)?;
+/// Most characters `clear` deletes. Longer text is unusual in a form field.
+const MAX_CLEAR: usize = 1000;
+
+/// Key presses that delete `n` characters around the cursor, wherever the tap put it.
+fn clear_keys(n: usize) -> Vec<String> {
+    let n = n.min(MAX_CLEAR);
+    let mut keys = vec!["input".to_string(), "keyevent".into()];
+    keys.extend(std::iter::repeat_n("KEYCODE_FORWARD_DEL".to_string(), n));
+    keys.extend(std::iter::repeat_n("KEYCODE_DEL".to_string(), n));
+    keys
+}
+
+/// Longest text the helper types in one go.
+const MAX_TYPE_CHARS: usize = 5000;
+
+fn type_into(state: &mut State, id: i64, text: &str, clear: bool, action: &str) -> Result<String, String> {
+    if let Some(c) = text.chars().find(|c| c.is_control()) {
+        let hint = if c == '\n' {
+            ": use press_key enter for a new line"
+        } else {
+            ""
+        };
+        return Err(format!("cannot type {c:?}{hint}"));
+    }
+    if text.chars().count() > MAX_TYPE_CHARS {
+        return Err(format!("text is too long: at most {MAX_TYPE_CHARS} characters at once"));
+    }
+    // `input text` types real key presses, like a keyboard, but knows only ASCII. Other text goes
+    // in through the helper, like a paste.
+    let ascii = text.is_ascii();
+    let args = if text.is_empty() || !ascii {
+        Vec::new()
+    } else {
+        input_text_args(text)?
+    };
     let e = pressable(state, id)?;
+    not_under_keyboard(state, e.center(), &format!("[{id}]"))?;
+    if !ascii {
+        if e.flags.contains(&"password") {
+            return Err("cannot type non-ASCII text into a password field".into());
+        }
+        if helper(state).is_none() {
+            let why = state.helper_off.clone().unwrap_or_default();
+            return Err(format!(
+                "cannot type non-ASCII text: the device helper does not run ({why}). Printable ASCII still works."
+            ));
+        }
+    }
     // Keep passwords out of the report.
     let shown = if e.flags.contains(&"password") {
         "(hidden)".to_string()
     } else {
         format!("{text:?}")
     };
-    state.remember(format!("{action} {}: {shown}", describe(id, &e)));
-    let (x, y) = e.center;
+    let cleared = if clear { " (cleared first)" } else { "" };
+    state.remember(format!("{action} {}: {shown}{cleared}", describe(id, &e)));
+    let (x, y) = e.center();
     adb(&["shell", "input", "tap", &x.to_string(), &y.to_string()])?;
     sleep(Duration::from_millis(300));
+    // The tap puts the cursor where it lands; text is added at the end, or replaces it all.
+    let typed_by_helper = !ascii;
+    let with_helper = helper(state).is_some();
+    if clear {
+        if with_helper {
+            let whole = if typed_by_helper { text } else { "" };
+            ask_helper(state, &json!({"cmd": "type", "text": whole, "replace": true}))
+                .map_err(|e| format!("could not clear the field: {e}"))?;
+        } else if e.text_len > 0 {
+            let keys = clear_keys(e.text_len);
+            let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+            adb(&[&["shell"][..], &keys].concat())?;
+        }
+    } else if with_helper {
+        ask_helper(state, &json!({"cmd": "end"})).map_err(|e| format!("could not reach the end of the field: {e}"))?;
+    } else {
+        adb(&["shell", "input", "keyevent", "KEYCODE_MOVE_END"])?;
+    }
     for arg in &args {
         adb(&["shell", "input", "text", arg])?;
+    }
+    if typed_by_helper && !clear {
+        ask_helper(state, &json!({"cmd": "type", "text": text}))
+            .map_err(|e| format!("could not type the text: {e}"))?;
     }
     sleep(SETTLE);
     read_screen(state)
@@ -828,7 +1240,8 @@ fn type_password(state: &mut State, id: i64) -> Result<String, String> {
             "[{id}] is not a password field. type_password types only into fields marked password; use type_text for the user name."
         ));
     }
-    type_into(state, id, &secret, "type_password")
+    // A field that already holds text would get the password added to it.
+    type_into(state, id, &secret, true, "type_password")
 }
 
 /// Hides the test password wherever it shows up in text that leaves PhantomQA.
@@ -845,6 +1258,193 @@ fn back(state: &mut State) -> Result<String, String> {
     adb(&["shell", "input", "keyevent", "KEYCODE_BACK"])?;
     sleep(SETTLE);
     read_screen(state)
+}
+
+/// The finger path for a scroll inside `area` on a `screen` of that size. `direction` is where to
+/// go in the content: "down" shows what is below, so the finger moves up.
+fn swipe_path(area: (i32, i32, i32, i32), (w, h): (i32, i32), direction: &str) -> Result<(i32, i32, i32, i32), String> {
+    // Keep off the screen edges: there, Android reads a swipe as back, home or the notification shade.
+    let (l, t, r, b) = (
+        area.0.max(w / 10),
+        area.1.max(h / 10),
+        area.2.min(w - w / 10),
+        area.3.min(h - h / 10),
+    );
+    if r - l < 40 || b - t < 40 {
+        return Err("that is too small to swipe in, or it is off the screen".into());
+    }
+    let (x, y) = ((l + r) / 2, (t + b) / 2);
+    // 60% of the area: far enough to move the content, short of its edges.
+    let (dx, dy) = ((r - l) * 3 / 10, (b - t) * 3 / 10);
+    match direction {
+        "down" => Ok((x, y + dy, x, y - dy)),
+        "up" => Ok((x, y - dy, x, y + dy)),
+        "right" => Ok((x + dx, y, x - dx, y)),
+        "left" => Ok((x - dx, y, x + dx, y)),
+        _ => Err(format!("direction must be up, down, left or right, not {direction:?}")),
+    }
+}
+
+/// Scrolls element [id], or the biggest scrollable element, or else the middle of the screen.
+fn scroll(state: &mut State, direction: &str, id: Option<i64>) -> Result<String, String> {
+    if !["down", "up", "left", "right"].contains(&direction) {
+        return Err(format!("direction must be up, down, left or right, not {direction:?}"));
+    }
+    let target = match id {
+        // A swipe on a row can do things, like delete it, so the avoid list holds.
+        Some(id) => {
+            let e = pressable(state, id)?;
+            Some((e.bounds, describe(id, &e)))
+        }
+        None => {
+            let size = |e: &Element| i64::from(e.bounds.2 - e.bounds.0) * i64::from(e.bounds.3 - e.bounds.1);
+            state
+                .elements
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.flags.contains(&"scroll"))
+                .max_by_key(|(_, e)| size(e))
+                .map(|(i, e)| (e.bounds, describe(i as i64 + 1, e)))
+        }
+    };
+    let screen = screen_size(state)?;
+    let (mut area, what) = target.unwrap_or(((0, 0, screen.0, screen.1), "the screen".to_string()));
+    // A swipe over the keyboard would type (glide typing), so stay above it. Without the helper
+    // its size is unknown; keyboards cover at most about half the screen.
+    if keyboard_open(state) {
+        let top = state.keyboard.map_or(screen.1 / 2, |k| k.1);
+        area.3 = area.3.min(top);
+    }
+    let (x1, y1, x2, y2) = swipe_path(area, screen, direction).map_err(|e| format!("cannot scroll {what}: {e}"))?;
+    let before = state.elements.clone();
+    state.remember(format!("scroll {direction} in {what}"));
+    let path = [x1, y1, x2, y2].map(|n| n.to_string());
+    adb(&["shell", "input", "swipe", &path[0], &path[1], &path[2], &path[3], "500"])?;
+    sleep(SETTLE);
+    let screen = read_screen(state)?;
+    if state.elements == before {
+        return Ok(format!(
+            "{screen}(nothing moved: this is the end, or there is nothing to scroll there)\n"
+        ));
+    }
+    Ok(screen)
+}
+
+fn long_press(state: &mut State, id: i64) -> Result<String, String> {
+    let e = pressable(state, id)?;
+    not_under_keyboard(state, e.center(), &format!("[{id}]"))?;
+    state.remember(format!("long_press {}", describe(id, &e)));
+    let (x, y) = e.center();
+    let (x, y) = (x.to_string(), y.to_string());
+    // A swipe that does not move, held for a second, is a long press.
+    adb(&["shell", "input", "swipe", &x, &y, &x, &y, "1000"])?;
+    sleep(SETTLE);
+    read_screen(state)
+}
+
+const KEYS: [(&str, &str); 4] = [
+    ("enter", "KEYCODE_ENTER"),
+    ("delete", "KEYCODE_DEL"),
+    ("tab", "KEYCODE_TAB"),
+    ("home", "KEYCODE_HOME"),
+];
+const MAX_KEY_TIMES: u64 = 50;
+
+/// Presses a key `times` times: enter sends a form or a search, delete removes one character.
+fn press_key(state: &mut State, key: &str, times: u64) -> Result<String, String> {
+    let names: Vec<&str> = KEYS.iter().map(|(name, _)| *name).collect();
+    let code = KEYS
+        .iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, code)| *code)
+        .ok_or_else(|| format!("key must be one of {}, not {key:?}", names.join(", ")))?;
+    if !(1..=MAX_KEY_TIMES).contains(&times) {
+        return Err(format!("times must be from 1 to {MAX_KEY_TIMES}"));
+    }
+    state.remember(if times == 1 {
+        format!("press_key {key}")
+    } else {
+        format!("press_key {key} x{times}")
+    });
+    let mut args = vec!["shell", "input", "keyevent"];
+    args.extend(std::iter::repeat_n(code, times as usize));
+    adb(&args)?;
+    sleep(SETTLE);
+    read_screen(state)
+}
+
+/// Biggest screenshot the agent gets. Images above about 5 MB are refused by the model.
+const MAX_LOOK_BYTES: usize = 3_500_000;
+
+/// A screenshot for the agent, for screens the element list cannot describe (games, maps,
+/// custom drawing). Returns the PNG and a note.
+fn look(state: &mut State) -> Result<(Vec<u8>, String), String> {
+    if !config().screenshots {
+        return Err("screenshots are off (--no-screenshots)".into());
+    }
+    let (w, h) = screen_size(state)?;
+    let png = screenshot()?;
+    if png.len() > MAX_LOOK_BYTES {
+        return Err(format!("the screenshot is too big to send ({} KB)", png.len() / 1024));
+    }
+    state.remember("look".into());
+    Ok((
+        png,
+        format!(
+            "Screenshot of the {w}x{h} screen. A screen that blocks screenshots, like many password and banking screens, shows black. For tap_at, x and y are percent of the width and height from the top left."
+        ),
+    ))
+}
+
+/// Taps a point given in percent of the screen, for apps that draw their own UI.
+fn tap_at(state: &mut State, x: f64, y: f64) -> Result<String, String> {
+    if !(0.0..=100.0).contains(&x) || !(0.0..=100.0).contains(&y) {
+        return Err("x and y must be percent of the screen, from 0 to 100".into());
+    }
+    let (w, h) = screen_size(state)?;
+    let point = (
+        ((w - 1) as f64 * x / 100.0).round() as i32,
+        ((h - 1) as f64 * y / 100.0).round() as i32,
+    );
+    // The avoid list holds here too: the screen must be current to know what is under the point.
+    if !state.avoid.is_empty() {
+        read_screen(state)?;
+        for (i, e) in state.elements.iter().enumerate() {
+            if e.contains(point)
+                && let Some(entry) = avoided(&state.avoid, &e.label)
+            {
+                return Err(format!(
+                    "refused: the point is on [{}], which matches {entry:?} from the test's avoid list. Do not press it; test something else.",
+                    i + 1
+                ));
+            }
+        }
+    }
+    not_under_keyboard(state, point, "that point")?;
+    state.remember(format!("tap_at {x}%, {y}% ({}, {})", point.0, point.1));
+    adb(&["shell", "input", "tap", &point.0.to_string(), &point.1.to_string()])?;
+    sleep(SETTLE);
+    read_screen(state)
+}
+
+/// Standard base64, for images in MCP replies.
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ABC[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 fn installed(package: &str) -> bool {
@@ -1961,7 +2561,9 @@ fn finish_session(state: &mut State) {
 
 const INSTRUCTIONS: &str = "PhantomQA lets you test an Android app on an emulator like a real user. \
 Start with launch_app, read the numbered screen list, and use tap, type_text and back. \
+Use scroll to see more of a list or page, long_press for menus, and press_key enter to send a form or a search. \
 For a test account password, use type_password; you never see the password. \
+If the screen list is empty or misses things (games, maps, custom drawing), use look to see a screenshot and tap_at to tap a point. \
 Try the main features, wrong inputs and edge cases. Call report_bug for each problem while it is on screen, \
 with clear steps to reproduce. Crashes and ANRs are found and saved automatically.";
 
@@ -1984,14 +2586,65 @@ fn tool_list() -> Value {
         },
         {
             "name": "type_text",
-            "description": "Tap element [id] (a text field) and type text into it. Printable ASCII only. Returns the new screen.",
+            "description": "Tap element [id] (a text field) and type text into it. The text is added to what the field holds, unless clear is true. Any language and emoji; no line breaks (use press_key enter). Returns the new screen.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "id": {"type": "integer", "description": "Element number of the text field"},
-                    "text": {"type": "string", "description": "Text to type"},
+                    "text": {"type": "string", "description": "Text to type. May be empty with clear, to leave the field empty."},
+                    "clear": {"type": "boolean", "description": "Delete the field's text first. Default: false"},
                 },
                 "required": ["id", "text"],
+            },
+        },
+        {
+            "name": "scroll",
+            "description": "Swipe to see more of a list or page. direction is where to go in the content: down shows what is below. Scrolls element [id], or else the biggest scrollable element, or else the middle of the screen. Says when nothing moved (the end). Returns the new screen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "direction": {"type": "string", "enum": ["down", "up", "left", "right"]},
+                    "id": {"type": "integer", "description": "Element to scroll in. Default: the biggest scrollable element"},
+                },
+                "required": ["direction"],
+            },
+        },
+        {
+            "name": "long_press",
+            "description": "Press and hold element [id] for a second, for context menus and selection. Returns the new screen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "integer", "description": "Element number from the last screen list"}},
+                "required": ["id"],
+            },
+        },
+        {
+            "name": "press_key",
+            "description": "Press a key: enter (send a form or a search), delete (remove the character before the cursor), tab (next field) or home (leave the app; launch_app comes back). Returns the new screen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "enum": ["enter", "delete", "tab", "home"]},
+                    "times": {"type": "integer", "description": "How many times, 1 to 50. Default: 1"},
+                },
+                "required": ["key"],
+            },
+        },
+        {
+            "name": "look",
+            "description": "See a screenshot of the screen. Use it when the screen list is empty or misses things: games, maps, charts, custom drawing. Then tap_at a point.",
+            "inputSchema": no_args,
+        },
+        {
+            "name": "tap_at",
+            "description": "Tap a point on the screen, in percent of its width and height from the top left (50, 50 is the middle). For apps that draw their own UI; otherwise use tap. Returns the new screen.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": {"type": "number", "description": "0 to 100, from the left"},
+                    "y": {"type": "number", "description": "0 to 100, from the top"},
+                },
+                "required": ["x", "y"],
             },
         },
         {
@@ -2050,6 +2703,13 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
             .map(str::to_string)
             .ok_or_else(|| format!("argument {key:?} must be a string"))
     };
+    let flag = |key: &str| match &args[key] {
+        Value::Null => Ok(false),
+        Value::Bool(b) => Ok(*b),
+        _ => Err(format!("argument {key:?} must be true or false")),
+    };
+    let percent =
+        |key: &str| percent_arg(&args[key]).ok_or_else(|| format!("argument {key:?} must be a number from 0 to 100"));
     if !state.video_checked {
         start_run(state);
     }
@@ -2062,10 +2722,31 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
     if state.crash_since.is_none() {
         state.crash_since = device_now().ok();
     }
+    let mut image = None;
     let result = match name {
         "screen" => read_screen(state),
         "tap" => int("id").and_then(|id| tap(state, id)),
-        "type_text" => int("id").and_then(|id| text("text").and_then(|t| type_text(state, id, &t))),
+        "type_text" => int("id")
+            .and_then(|id| text("text").and_then(|t| flag("clear").and_then(|clear| type_text(state, id, &t, clear)))),
+        "scroll" => text("direction").and_then(|direction| match &args["id"] {
+            Value::Null => scroll(state, &direction, None),
+            _ => int("id").and_then(|id| scroll(state, &direction, Some(id))),
+        }),
+        "long_press" => int("id").and_then(|id| long_press(state, id)),
+        "press_key" => text("key").and_then(|key| {
+            let times = match &args["times"] {
+                Value::Null => Ok(1),
+                value => int_arg(value)
+                    .and_then(|n| u64::try_from(n).ok())
+                    .ok_or_else(|| "argument \"times\" must be a whole number".to_string()),
+            };
+            times.and_then(|times| press_key(state, &key, times))
+        }),
+        "look" => look(state).map(|(png, note)| {
+            image = Some(png);
+            note
+        }),
+        "tap_at" => percent("x").and_then(|x| percent("y").and_then(|y| tap_at(state, x, y))),
         "type_password" => int("id").and_then(|id| type_password(state, id)),
         "back" => back(state),
         "launch_app" => text("package").and_then(|p| launch_app(state, &p)),
@@ -2075,7 +2756,18 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
     };
     let checks_crashes = matches!(
         name,
-        "screen" | "tap" | "type_text" | "type_password" | "back" | "launch_app" | "crashes"
+        "screen"
+            | "tap"
+            | "type_text"
+            | "type_password"
+            | "back"
+            | "launch_app"
+            | "crashes"
+            | "scroll"
+            | "long_press"
+            | "press_key"
+            | "look"
+            | "tap_at"
     );
     let notice = if checks_crashes {
         crash_notice(state)
@@ -2092,7 +2784,19 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
     }
     text.push_str(&notice);
     let text = redact(state, text);
-    json!({"content": [{"type": "text", "text": text.trim_start()}], "isError": is_error})
+    let mut content = vec![json!({"type": "text", "text": text.trim_start()})];
+    if let Some(png) = image {
+        content.push(json!({"type": "image", "data": base64(&png), "mimeType": "image/png"}));
+    }
+    json!({"content": content, "isError": is_error})
+}
+
+/// A percent sent as 50, 50.5, "50" or "50%".
+fn percent_arg(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.trim().trim_end_matches('%').trim().parse().ok())
+        .filter(|p: &f64| p.is_finite() && (0.0..=100.0).contains(p))
 }
 
 /// An element number sent as 3, 3.0, "3" or "[3]".
@@ -3204,7 +3908,19 @@ fn handle_http(request: tiny_http::Request, reports: &Path, tokens: &Path) {
 // makes the run folder, starts Claude Code with PhantomQA as its only tools, and stops it at
 // the time limit. The session itself runs in the MCP worker, which takes over the folder.
 
-const TEST_FIELDS: [&str; 7] = ["app", "apk", "goal", "avoid", "login", "model", "max_minutes"];
+const TEST_FIELDS: [&str; 9] = [
+    "app",
+    "apk",
+    "goal",
+    "avoid",
+    "login",
+    "model",
+    "max_minutes",
+    "clear_data",
+    "snapshot",
+];
+/// Loading a snapshot takes a few seconds; the device then needs a moment to come back.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGIN_FIELDS: [&str; 2] = ["user", "password_env"];
 const DEFAULT_MODEL: &str = "sonnet";
 const DEFAULT_MAX_MINUTES: u64 = 30;
@@ -3233,6 +3949,10 @@ struct TestFile {
     login: Option<Login>,
     model: String,
     max_minutes: u64,
+    /// Clear the app's data before the test, like a fresh install.
+    clear_data: bool,
+    /// Load this emulator snapshot before the test.
+    snapshot: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -3320,8 +4040,8 @@ fn parse_test(text: &str, base: &Path) -> Result<TestFile, String> {
             unknown(login, &LOGIN_FIELDS).map_err(|e| format!("\"login\": {e}"))?;
             let user =
                 text_field(login, "user")?.ok_or("\"login\" needs \"user\": the test account's email or user name")?;
-            if input_text_args(&user).is_err() {
-                return Err("\"login\".\"user\" must be printable ASCII".into());
+            if user.chars().any(char::is_control) {
+                return Err("\"login\".\"user\" must be one line of text".into());
             }
             let password_env = text_field(login, "password_env")?.ok_or(
                 "\"login\" needs \"password_env\": the env var that holds the password, like SHOP_QA_PASSWORD",
@@ -3335,6 +4055,19 @@ fn parse_test(text: &str, base: &Path) -> Result<TestFile, String> {
         }
         Some(_) => return Err("\"login\" must be an object: {\"user\": \"...\", \"password_env\": \"...\"}".into()),
     };
+    let clear_data = match obj.get("clear_data") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("\"clear_data\" must be true or false".into()),
+    };
+    let snapshot = text_field(obj, "snapshot")?;
+    if let Some(name) = &snapshot
+        && !valid_token_name(name)
+    {
+        return Err(format!(
+            "\"snapshot\" must be a snapshot name: letters, digits, '.', '_' and '-', not {name:?}"
+        ));
+    }
     Ok(TestFile {
         name: String::new(),
         app,
@@ -3344,6 +4077,8 @@ fn parse_test(text: &str, base: &Path) -> Result<TestFile, String> {
         login,
         model,
         max_minutes,
+        clear_data,
+        snapshot,
     })
 }
 
@@ -3359,6 +4094,12 @@ impl TestFile {
             "model": self.model,
             "max_minutes": self.max_minutes,
         });
+        if self.clear_data {
+            doc["clear_data"] = json!(true);
+        }
+        if let Some(snapshot) = &self.snapshot {
+            doc["snapshot"] = json!(snapshot);
+        }
         if let Some(apk) = self.apk.as_deref().and_then(file_name) {
             doc["apk"] = json!(apk);
         }
@@ -3431,6 +4172,39 @@ fn device_lock() -> Result<fs::File, String> {
     }
 }
 
+/// Puts the emulator back to a saved snapshot, and waits until it is ready again.
+fn load_snapshot(name: &str) -> Result<(), String> {
+    let serial = adb(&["get-serialno"])?.trim().to_string();
+    if !serial.starts_with("emulator-") {
+        return Err(format!(
+            "\"snapshot\" works only on an emulator, and {serial} is not one. On a phone, use \"clear_data\": true."
+        ));
+    }
+    let out = adb_bytes_for(&["emu", "avd", "snapshot", "load", name], SNAPSHOT_TIMEOUT)
+        .map(|out| String::from_utf8_lossy(&out).into_owned())
+        .unwrap_or_else(|e| e);
+    if out.contains("KO") || !out.contains("OK") {
+        return Err(format!(
+            "could not load the snapshot {name:?}: {}. Save one first with: adb emu avd snapshot save {name}",
+            one_line(out.trim(), 300)
+        ));
+    }
+    // The device is offline for a moment after the load.
+    let start = Instant::now();
+    loop {
+        let ready = adb(&["shell", "getprop", "sys.boot_completed"]).is_ok_and(|out| out.trim() == "1");
+        if ready {
+            return Ok(());
+        }
+        if start.elapsed() > SNAPSHOT_TIMEOUT {
+            return Err(format!(
+                "the emulator did not come back after loading the snapshot {name:?}"
+            ));
+        }
+        sleep(Duration::from_millis(500));
+    }
+}
+
 fn install_apk(apk: &Path, app: &str) -> Result<(), String> {
     if !apk.is_file() {
         return Err(format!("apk not found: {}", apk.display()));
@@ -3480,6 +4254,9 @@ fn mcp_config(run_dir: &Path) -> Result<Value, String> {
     }
     if !config.screenshots {
         args.push("--no-screenshots".into());
+    }
+    if !config.helper {
+        args.push("--no-helper".into());
     }
     args.push("mcp".into());
     Ok(json!({"mcpServers": {"phantomqa": {
@@ -3769,6 +4546,9 @@ fn run_test(path: &Path, routine: Option<&str>) -> Result<(String, i32), String>
     first_line(&config.claude, "--version")
         .map_err(|e| format!("{e}. Install Claude Code, or set --claude or PHANTOMQA_CLAUDE."))?;
     let _device = device_lock()?;
+    if let Some(name) = &test.snapshot {
+        load_snapshot(name)?;
+    }
     match &test.apk {
         Some(apk) => install_apk(apk, &test.app)?,
         None if !installed(&test.app) => {
@@ -3778,6 +4558,16 @@ fn run_test(path: &Path, routine: Option<&str>) -> Result<(String, i32), String>
             ));
         }
         None => {}
+    }
+    if test.clear_data {
+        let out = adb(&["shell", "pm", "clear", &test.app]).unwrap_or_else(|e| e);
+        if !out.contains("Success") {
+            return Err(format!(
+                "could not clear the data of {}: {}",
+                test.app,
+                one_line(out.trim(), 300)
+            ));
+        }
     }
 
     let mut info = test.to_json();
@@ -4369,6 +5159,26 @@ fn doctor() -> bool {
         if device_works {
             let screen = dump_xml().map(|xml| format!("works ({} elements on screen)", parse_screen(&xml).1.len()));
             check(true, "screen reading", screen, "unlock the device screen and try again");
+            let helper = if config.helper {
+                start_helper().and_then(|mut helper| {
+                    let start = Instant::now();
+                    match helper.ask(&json!({"cmd": "dump"})) {
+                        Ok(_) => Ok(format!(
+                            "works (reads the screen in {} ms)",
+                            start.elapsed().as_millis()
+                        )),
+                        Err(HelperError::Broken(e) | HelperError::Refused(e)) => Err(e),
+                    }
+                })
+            } else {
+                Err("turned off (--no-helper or PHANTOMQA_HELPER=0)".into())
+            };
+            check(
+                false,
+                "device helper",
+                helper,
+                "testing still works: the screen is read the slower way, and typing is printable ASCII only",
+            );
             let recorder = adb(&["shell", "command -v screenrecord"])
                 .map(|p| p.trim().to_string())
                 .and_then(|p| if p.is_empty() { Err("not found".into()) } else { Ok(p) });
@@ -4448,6 +5258,10 @@ commands:
   screen              print the current screen
   tap N               tap element N
   type N TEXT         tap element N and type TEXT
+  scroll DIR [N]      scroll down, up, left or right (in element N)
+  long-press N        press and hold element N
+  key NAME [TIMES]    press enter, delete, tab or home
+  tap-at X Y          tap a point, in percent of the screen (50 50 is the middle)
   back                press back
   launch PACKAGE      start an app
   crashes             list crashes and ANRs in the device's crash log
@@ -4464,6 +5278,7 @@ options (each also has an env var):
   --ffmpeg PATH       ffmpeg, optional      FFMPEG  (default: PATH)
   --no-video          do not record video   PHANTOMQA_VIDEO=0
   --no-screenshots    no screenshots        PHANTOMQA_SCREENSHOTS=0
+  --no-helper         no device helper      PHANTOMQA_HELPER=0  (slower screen reading, ASCII typing)
   --tokens PATH       API tokens file       PHANTOMQA_TOKENS  (default: tokens.json)
   --claude PATH       Claude Code, for run  PHANTOMQA_CLAUDE  (default: claude on PATH)
   --routines PATH     scheduled tests       PHANTOMQA_ROUTINES  (default: routines.json)";
@@ -4527,8 +5342,22 @@ fn main() {
         ["tap", n] => id(n).and_then(|n| read_screen(&mut state).and_then(|_| tap(&mut state, n))),
         ["type", n, ref text @ ..] if !text.is_empty() => {
             let text = text.join(" ");
-            id(n).and_then(|n| read_screen(&mut state).and_then(|_| type_text(&mut state, n, &text)))
+            id(n).and_then(|n| read_screen(&mut state).and_then(|_| type_text(&mut state, n, &text, false)))
         }
+        ["scroll", direction] => read_screen(&mut state).and_then(|_| scroll(&mut state, direction, None)),
+        ["scroll", direction, n] => {
+            id(n).and_then(|n| read_screen(&mut state).and_then(|_| scroll(&mut state, direction, Some(n))))
+        }
+        ["long-press", n] => id(n).and_then(|n| read_screen(&mut state).and_then(|_| long_press(&mut state, n))),
+        ["key", key] => press_key(&mut state, key, 1),
+        ["key", key, times] => times
+            .parse()
+            .map_err(|_| format!("not a number: {times}"))
+            .and_then(|times| press_key(&mut state, key, times)),
+        ["tap-at", x, y] => match (x.trim_end_matches('%').parse(), y.trim_end_matches('%').parse()) {
+            (Ok(x), Ok(y)) => read_screen(&mut state).and_then(|_| tap_at(&mut state, x, y)),
+            _ => Err("x and y must be percent numbers, like 50 30".into()),
+        },
         ["back"] => back(&mut state),
         ["launch", package] => launch_app(&mut state, package),
         _ => {
@@ -4587,7 +5416,9 @@ mod tests {
              [4] Switch \"Dark mode\" click on disabled\n\
              [5] TextView \"Footer\"\n"
         );
-        assert_eq!(elements[2].center, (540, 570));
+        assert_eq!(elements[2].center(), (540, 570));
+        assert_eq!(elements[2].bounds, (0, 500, 1080, 640));
+        assert!(elements[2].contains((0, 500)) && !elements[2].contains((1080, 570)));
     }
 
     #[test]
@@ -4663,7 +5494,12 @@ mod tests {
 
         let list = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let tools = handle_message(&mut state, &list).unwrap();
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 8);
+        let tools = tools["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 13);
+        // Every tool the server handles is listed, and every listed tool has a schema.
+        for tool in tools {
+            assert!(tool["inputSchema"]["type"] == "object", "{}", tool["name"]);
+        }
 
         let bad_tap = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "tap", "arguments": {"id": "x"}}});
         let reply = handle_message(&mut state, &bad_tap).unwrap();
@@ -4853,7 +5689,13 @@ mod tests {
         assert_eq!(start, 0);
 
         let (config, _) = load_config(&args(&["--no-screenshots", "mcp"]), &no_env).unwrap();
-        assert!(!config.screenshots && config.video);
+        assert!(!config.screenshots && config.video && config.helper);
+        let (config, _) = load_config(&args(&["--no-helper", "mcp"]), &no_env).unwrap();
+        assert!(!config.helper);
+        assert!(load_config(&args(&["--no-helper=1"]), &no_env).is_err());
+        let (config, _) =
+            load_config(&[], &|name: &str| (name == "PHANTOMQA_HELPER").then(|| "0".to_string())).unwrap();
+        assert!(!config.helper);
         assert!(load_config(&args(&["--no-video=1"]), &no_env).is_err());
 
         assert!(load_config(&args(&["--adb"]), &no_env).is_err());
@@ -5671,8 +6513,32 @@ mod tests {
             })
         );
         let saved = test.to_json();
+        assert!(saved.get("clear_data").is_none() && saved.get("snapshot").is_none());
         assert_eq!(saved["apk"], "app.apk", "no local paths in run.json");
+        let reset = parse_test(
+            r#"{"app": "com.x", "goal": "g", "clear_data": true, "snapshot": "clean-1"}"#,
+            base,
+        )
+        .unwrap();
+        assert!(reset.clear_data);
+        assert_eq!(reset.snapshot.as_deref(), Some("clean-1"));
+        assert_eq!(
+            (
+                reset.to_json()["clear_data"].clone(),
+                reset.to_json()["snapshot"].clone()
+            ),
+            (json!(true), json!("clean-1"))
+        );
         assert_eq!(saved["login"]["password_env"], "SHOP_QA_PASSWORD");
+        let unicode = parse_test(
+            r#"{"app": "com.x", "goal": "g", "login": {"user": "jürgen@example.de", "password_env": "P"}}"#,
+            base,
+        );
+        assert_eq!(
+            unicode.unwrap().login.unwrap().user,
+            "jürgen@example.de",
+            "the helper types any user name"
+        );
 
         for (bad, why) in [
             ("[]", "must be a JSON object"),
@@ -5715,9 +6581,15 @@ mod tests {
                 "env var name",
             ),
             (
-                r#"{"app": "com.x", "goal": "g", "login": {"user": "ü", "password_env": "P"}}"#,
-                "printable ASCII",
+                r#"{"app": "com.x", "goal": "g", "login": {"user": "a\tb", "password_env": "P"}}"#,
+                "one line of text",
             ),
+            (r#"{"app": "com.x", "goal": "g", "clear_data": "yes"}"#, "true or false"),
+            (
+                r#"{"app": "com.x", "goal": "g", "snapshot": "my snap"}"#,
+                "snapshot name",
+            ),
+            (r#"{"app": "com.x", "goal": "g", "snapshot": ""}"#, "non-empty string"),
         ] {
             let error = parse_test(bad, base).unwrap_err();
             assert!(error.contains(why), "{bad}: {error}");
@@ -5777,7 +6649,11 @@ mod tests {
         let error = tap(&mut state, row).unwrap_err();
         assert!(error.contains("refused") && error.contains("avoid list"), "{error}");
         let switch = state.elements.iter().position(|e| e.label == "Dark mode").unwrap() as i64 + 1;
-        assert!(type_text(&mut state, switch, "x").unwrap_err().contains("refused"));
+        assert!(
+            type_text(&mut state, switch, "x", false)
+                .unwrap_err()
+                .contains("refused")
+        );
         assert!(state.history.is_empty(), "refused actions are not in the history");
     }
 
@@ -6311,5 +7187,191 @@ mod tests {
         running.lock().unwrap().extend(["a".to_string(), "b".to_string()]);
         drop(Running(running.clone(), "a".into()));
         assert_eq!(*running.lock().unwrap(), ["b"]);
+    }
+
+    #[test]
+    fn scroll_paths_stay_off_the_screen_edges() {
+        let screen = (1080, 2400);
+        // A full-screen list: the finger stays inside 10% to 90%, and moves 60% of that.
+        let (x1, y1, x2, y2) = swipe_path((0, 0, 1080, 2400), screen, "down").unwrap();
+        assert_eq!((x1, x2), (540, 540));
+        assert!(y1 > y2, "down: the finger moves up");
+        assert!(y1 <= 2160 && y2 >= 240, "{y1} {y2}");
+        let (_, up1, _, up2) = swipe_path((0, 0, 1080, 2400), screen, "up").unwrap();
+        assert!(up1 < up2);
+        let (rx1, _, rx2, _) = swipe_path((0, 0, 1080, 2400), screen, "right").unwrap();
+        assert!(rx1 > rx2 && rx2 >= 108 && rx1 <= 972, "right: the finger moves left");
+        let (lx1, _, lx2, _) = swipe_path((0, 0, 1080, 2400), screen, "left").unwrap();
+        assert!(lx1 < lx2);
+        // A carousel inside the screen keeps its own middle.
+        assert_eq!(
+            swipe_path((200, 1000, 800, 1400), screen, "right").unwrap(),
+            (680, 1200, 320, 1200)
+        );
+        // Too small, or off the screen.
+        assert!(swipe_path((0, 0, 1080, 30), screen, "down").is_err());
+        assert!(swipe_path((0, 2380, 1080, 2400), screen, "down").is_err());
+        assert!(
+            swipe_path((0, 0, 1080, 2400), screen, "sideways")
+                .unwrap_err()
+                .contains("up, down, left or right")
+        );
+    }
+
+    #[test]
+    fn reads_screen_size_and_rotation() {
+        assert_eq!(parse_wm_size("Physical size: 1080x2400\n"), Some((1080, 2400)));
+        assert_eq!(
+            parse_wm_size("Physical size: 1080x2400\nOverride size: 720x1600\n"),
+            Some((720, 1600))
+        );
+        assert_eq!(parse_wm_size("error: no display\n"), None);
+        assert_eq!(parse_wm_size("Physical size: 0x0\n"), None);
+        assert_eq!(hierarchy_rotation(r#"<hierarchy rotation="1"><node/></hierarchy>"#), 1);
+        assert_eq!(hierarchy_rotation("<hierarchy><node/></hierarchy>"), 0);
+        let mut state = test_state();
+        state.display = Some((1080, 2400));
+        assert_eq!(screen_size(&mut state), Ok((1080, 2400)));
+        state.rotation = 1;
+        assert_eq!(screen_size(&mut state), Ok((2400, 1080)), "turned sideways");
+    }
+
+    #[test]
+    fn new_actions_check_their_arguments_first() {
+        let mut state = test_state();
+        state.elements = parse_screen(SAMPLE).1;
+        state.display = Some((1080, 2400));
+        assert!(
+            press_key(&mut state, "escape", 1)
+                .unwrap_err()
+                .contains("enter, delete, tab, home")
+        );
+        assert!(press_key(&mut state, "enter", 0).unwrap_err().contains("from 1 to 50"));
+        assert!(press_key(&mut state, "enter", 51).is_err());
+        assert!(type_text(&mut state, 2, "", false).unwrap_err().contains("clear: true"));
+        assert!(tap_at(&mut state, 101.0, 5.0).is_err());
+        assert!(tap_at(&mut state, 5.0, -1.0).is_err());
+        assert!(
+            scroll(&mut state, "down", Some(99))
+                .unwrap_err()
+                .contains("no element [99]")
+        );
+        state.avoid = vec!["wi-fi".into()];
+        assert!(scroll(&mut state, "right", Some(3)).unwrap_err().contains("avoid list"));
+        assert!(long_press(&mut state, 3).unwrap_err().contains("avoid list"));
+        assert!(state.history.is_empty(), "nothing refused is in the history");
+
+        assert_eq!(
+            clear_keys(2),
+            [
+                "input",
+                "keyevent",
+                "KEYCODE_FORWARD_DEL",
+                "KEYCODE_FORWARD_DEL",
+                "KEYCODE_DEL",
+                "KEYCODE_DEL"
+            ]
+        );
+        assert_eq!(clear_keys(5000).len(), 2 + 2 * MAX_CLEAR);
+        for (value, want) in [
+            (json!(50), Some(50.0)),
+            (json!(12.5), Some(12.5)),
+            (json!("30"), Some(30.0)),
+            (json!(" 30 % "), Some(30.0)),
+            (json!(100), Some(100.0)),
+            (json!(100.1), None),
+            (json!(-1), None),
+            (json!("half"), None),
+            (json!(null), None),
+        ] {
+            assert_eq!(percent_arg(&value), want, "{value}");
+        }
+    }
+
+    #[test]
+    fn encodes_base64() {
+        for (input, out) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(input.as_bytes()), out);
+        }
+        assert_eq!(base64(&[0xff, 0xfe, 0x00]), "//4A");
+    }
+
+    #[test]
+    fn device_helper_is_built_in_and_typing_checks_first() {
+        assert!(HELPER_JAR.starts_with(b"PK"), "a jar is a zip file");
+        let path = helper_path();
+        assert!(path.starts_with("/data/local/tmp/phantomqa-helper-") && path.ends_with(".jar"));
+        assert_eq!(path, helper_path(), "the same jar, the same name");
+        assert!(
+            Helper::java_version_matches(),
+            "HELPER_VERSION and Helper.VERSION in Helper.java"
+        );
+
+        let mut state = test_state();
+        state.elements = parse_screen(SAMPLE).1;
+        state.helper_off = Some("no device here".into());
+        let error = type_text(&mut state, 2, "héllo", false).unwrap_err();
+        assert!(error.contains("device helper does not run (no device here)"), "{error}");
+        assert!(
+            type_text(&mut state, 2, "two\nlines", false)
+                .unwrap_err()
+                .contains("press_key enter")
+        );
+        assert!(type_text(&mut state, 2, "tab\there", false).is_err());
+        assert!(
+            type_text(&mut state, 2, &"x".repeat(MAX_TYPE_CHARS + 1), false)
+                .unwrap_err()
+                .contains("too long")
+        );
+        state.elements[1].flags.push("password");
+        assert!(
+            type_text(&mut state, 2, "pässword", false)
+                .unwrap_err()
+                .contains("password field")
+        );
+        assert!(state.history.is_empty(), "nothing refused is in the history");
+    }
+
+    #[test]
+    fn keeps_touches_off_the_keyboard() {
+        let xml = r#"<?xml version='1.0' ?><hierarchy rotation="0" keyboard="[0,1400][1080,2400]"><node bounds="[0,0][1080,2400]"/></hierarchy>"#;
+        assert_eq!(hierarchy_keyboard(xml), Some((0, 1400, 1080, 2400)));
+        assert_eq!(hierarchy_keyboard(SAMPLE), None);
+        assert_eq!(
+            hierarchy_keyboard(r#"<hierarchy rotation="0" keyboard="[0,0][0,0]">"#),
+            None,
+            "empty is hidden"
+        );
+        assert_eq!(
+            hierarchy_keyboard(r#"<hierarchy rotation="0"><node keyboard="[0,1][2,3]"/></hierarchy>"#),
+            None,
+            "only the hierarchy tag counts"
+        );
+
+        let mut state = test_state();
+        state.elements = parse_screen(SAMPLE).1;
+        state.display = Some((1080, 2400));
+        state.keyboard = Some((0, 1400, 1080, 2400));
+        // [5] "Footer" sits at the bottom, under the keyboard.
+        assert!(tap(&mut state, 5).unwrap_err().contains("under the keyboard"));
+        assert!(long_press(&mut state, 5).unwrap_err().contains("under the keyboard"));
+        assert!(
+            type_text(&mut state, 5, "x", false)
+                .unwrap_err()
+                .contains("under the keyboard")
+        );
+        assert!(
+            tap_at(&mut state, 50.0, 99.0)
+                .unwrap_err()
+                .contains("under the keyboard")
+        );
+        assert!(state.history.is_empty());
     }
 }

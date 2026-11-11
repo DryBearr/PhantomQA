@@ -117,6 +117,8 @@
           "avoid": { "type": "array", "items": { "type": "string" } },
           "model": { "type": "string" },
           "max_minutes": { "type": "integer" },
+          "clear_data": { "type": "boolean", "description": "The app's data was cleared before the test." },
+          "snapshot": { "type": "string", "description": "The emulator snapshot loaded before the test." },
           "apk": { "type": "string", "description": "File name only." },
           "login": {
             "type": "object",
