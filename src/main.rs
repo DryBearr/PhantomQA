@@ -3454,14 +3454,57 @@ struct ApiRequest<'a> {
     range: Option<&'a str>,
 }
 
+/// Is this a `/v1` route? Those answer browsers from any website (CORS).
+fn is_v1(url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or("");
+    path == "/v1" || path.starts_with("/v1/")
+}
+
 /// Answers one request. Also returns the token's name, for the log line.
+///
+/// `/v1` routes allow every origin (CORS). That is safe because the token travels in the
+/// Authorization header, which a browser never adds by itself: a website without the token
+/// gets 401 and reads nothing. `/health` and `/openapi.json` stay closed to other websites,
+/// so a website cannot tell that PhantomQA runs on this machine.
 fn route(req: &ApiRequest, reports: &Path, tokens: &Path) -> (Reply, Option<String>) {
+    let (mut reply, who) = answer(req, reports, tokens);
+    if is_v1(req.url) && req.url.len() <= MAX_URL {
+        reply.headers.push(("Access-Control-Allow-Origin", "*".into()));
+        // Headers a page may read besides the basic ones: for video seeking and for 401.
+        reply.headers.push((
+            "Access-Control-Expose-Headers",
+            "Content-Range, Accept-Ranges, WWW-Authenticate".into(),
+        ));
+    }
+    (reply, who)
+}
+
+fn answer(req: &ApiRequest, reports: &Path, tokens: &Path) -> (Reply, Option<String>) {
     if req.url.len() > MAX_URL {
         return (Reply::error(414, "uri_too_long", "the URL is too long"), None);
     }
+    let v1 = is_v1(req.url);
+    // A browser asks first, without the token, whether a page may send it. Same answer for
+    // every /v1 path, so this shows no routes.
+    if req.method == "OPTIONS" && v1 {
+        let reply = Reply {
+            status: 204,
+            headers: vec![
+                ("Access-Control-Allow-Methods", "GET, HEAD".into()),
+                // "*" alone does not cover Authorization, so it is named.
+                ("Access-Control-Allow-Headers", "Authorization, Range, *".into()),
+                // A dashboard on a public website may call this machine (Chrome asks for this).
+                ("Access-Control-Allow-Private-Network", "true".into()),
+                ("Access-Control-Max-Age", "600".into()),
+            ],
+            body: Body::Bytes(Vec::new()),
+        };
+        return (reply, None);
+    }
     if req.method != "GET" && req.method != "HEAD" {
-        let mut reply = Reply::error(405, "method_not_allowed", "only GET and HEAD are supported");
-        reply.headers.push(("Allow", "GET, HEAD".into()));
+        let allow = if v1 { "GET, HEAD, OPTIONS" } else { "GET, HEAD" };
+        let mut reply = Reply::error(405, "method_not_allowed", &format!("only {allow} are supported"));
+        reply.headers.push(("Allow", allow.into()));
         return (reply, None);
     }
     let (path, query) = req.url.split_once('?').unwrap_or((req.url, ""));
@@ -6232,10 +6275,57 @@ mod tests {
         assert_eq!(api.request("GET", "/nope", None, None).status, 404);
         let post = api.request("POST", "/v1/runs", None, None);
         assert_eq!(post.status, 405);
-        assert_eq!(header(&post, "Allow"), Some("GET, HEAD"));
-        assert_eq!(api.request("DELETE", "/health", None, None).status, 405);
+        assert_eq!(header(&post, "Allow"), Some("GET, HEAD, OPTIONS"));
+        let delete = api.request("DELETE", "/health", None, None);
+        assert_eq!(delete.status, 405);
+        assert_eq!(header(&delete, "Allow"), Some("GET, HEAD"));
         let long = format!("/v1/runs?{}", "x".repeat(3000));
         assert_eq!(api.request("GET", &long, None, None).status, 414);
+    }
+
+    #[test]
+    fn api_answers_browsers_on_v1_only() {
+        let api = Api::new("cors");
+        // The browser's check comes without a token, for any /v1 path, and gets the same answer.
+        for path in ["/v1/runs", "/v1/runs/1/files/session.mp4", "/v1/secret-route"] {
+            let check = api.request("OPTIONS", path, None, None);
+            assert_eq!(check.status, 204, "{path}");
+            assert_eq!(header(&check, "Access-Control-Allow-Origin"), Some("*"));
+            assert_eq!(header(&check, "Access-Control-Allow-Methods"), Some("GET, HEAD"));
+            assert!(
+                header(&check, "Access-Control-Allow-Headers")
+                    .unwrap()
+                    .contains("Authorization")
+            );
+            assert!(body(check).is_empty());
+        }
+        // Every /v1 answer can be read by the page, errors too.
+        let ok = api.get("/v1/runs");
+        assert_eq!(
+            (ok.status, header(&ok, "Access-Control-Allow-Origin")),
+            (200, Some("*"))
+        );
+        assert!(
+            header(&ok, "Access-Control-Expose-Headers")
+                .unwrap()
+                .contains("Content-Range")
+        );
+        let denied = api.request("GET", "/v1/runs", None, None);
+        assert_eq!(
+            (denied.status, header(&denied, "Access-Control-Allow-Origin")),
+            (401, Some("*"))
+        );
+        assert_eq!(header(&api.get("/v1/nope"), "Access-Control-Allow-Origin"), Some("*"));
+        // Not the public routes, and not lookalike paths.
+        for path in ["/health", "/openapi.json", "/v10/runs", "/v1x"] {
+            assert_eq!(
+                header(&api.request("GET", path, None, None), "Access-Control-Allow-Origin"),
+                None,
+                "{path}"
+            );
+        }
+        assert_eq!(api.request("OPTIONS", "/health", None, None).status, 405);
+        assert!(is_v1("/v1") && is_v1("/v1/runs?limit=2") && !is_v1("/v1x") && !is_v1("/"));
     }
 
     #[test]

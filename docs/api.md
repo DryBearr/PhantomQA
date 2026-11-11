@@ -44,7 +44,24 @@ Revoking or rotating a token works on the next request. Without a token, unknown
 | GET | `/v1/runs/{run}/files/{name}` | yes | a file of the run |
 | GET | `/v1/runs/{run}/files/video/{name}` | yes | a raw video part |
 
-HEAD works wherever GET does. Other methods get `405` with `Allow: GET, HEAD`.
+HEAD works wherever GET does. Other methods get `405` with `Allow: GET, HEAD` (`GET, HEAD, OPTIONS` on `/v1`).
+
+## Calling from a browser (CORS)
+
+A dashboard page on any website may call the `/v1` routes directly:
+
+```js
+const res = await fetch("http://127.0.0.1:7070/v1/runs", {
+  headers: { Authorization: `Bearer ${token}` },
+});
+```
+
+- Every `/v1` answer, errors too, has `Access-Control-Allow-Origin: *`, and exposes `Content-Range`, `Accept-Ranges` and `WWW-Authenticate` to the page.
+- The browser's `OPTIONS` check needs no token, and gets `204` for any `/v1` path: GET and HEAD, with the `Authorization` and `Range` headers.
+- This is safe because the token is a header, not a cookie: a browser never sends it by itself, so a website without the token gets `401` and reads nothing.
+- `/health` and `/openapi.json` have no CORS headers, so other websites cannot tell that PhantomQA runs on your machine.
+- A token in a web page can be seen by everyone who uses the page. Give the dashboard its own token with an expiry (`phantomqa token add dashboard --expires 30d`). Or let the dashboard's server call the API, and keep the token there.
+- Chrome may ask the user before a page on a public website reaches `127.0.0.1` or the local network. PhantomQA answers Chrome's check for that (`Access-Control-Allow-Private-Network: true`), but the user's permission is up to Chrome.
 
 ### List runs
 

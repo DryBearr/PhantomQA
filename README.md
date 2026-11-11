@@ -232,6 +232,8 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7070/v1/runs
 | `GET /v1/runs/{run}/files/{name}` | report, screenshots, videos (with seeking), logs |
 | `GET /openapi.json` | the OpenAPI description (no token) |
 
+A dashboard page on any website can call `/v1` from the browser (CORS), with its token in the `Authorization` header. A website without a token gets nothing.
+
 Full docs: [docs/api.md](docs/api.md). Each run folder also has `run.json`, the same data as `GET /v1/runs/{run}`.
 
 ## API tokens
