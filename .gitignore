@@ -1,12 +1,15 @@
 # Build output
 /target/
 
+# Test reports (screenshots, logs, videos)
+/reports/
+
+# Your local MCP config (copy .mcp.json.example)
+/.mcp.json
+
 # Local files
 .env
 *.log
 .DS_Store
 .idea/
 .vscode/
-
-# Test reports (screenshots and logs)
-/reports/

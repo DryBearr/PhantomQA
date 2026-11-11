@@ -3,17 +3,18 @@
 //! `phantomqa mcp` runs an MCP server over stdio (for Claude Code and other agents).
 //! `phantomqa screen | tap N | type N TEXT | back | launch PACKAGE | crashes` does the same by hand.
 //!
-//! Everything goes through `adb`. Set ANDROID_SERIAL when more than one device is connected.
-//! Bug reports go to ./reports/<start time>/ (change the root with PHANTOMQA_REPORTS).
+//! Everything goes through `adb`. Run `phantomqa doctor` to check the setup.
+//! Bug reports go to ./reports/run-NNN/. See `phantomqa --help` for the paths you can set.
 
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// How long to wait after an action before reading the screen again.
 const SETTLE: Duration = Duration::from_millis(500);
@@ -48,8 +49,6 @@ struct State {
     /// Logcat time ("sssss.mmm") to read crashes from. None until the first check.
     crash_since: Option<String>,
     report_root: PathBuf,
-    /// When this run started, for the report header.
-    started: String,
     /// Created on the first bug.
     report: Option<Report>,
 }
@@ -67,7 +66,6 @@ impl State {
             history: Vec::new(),
             crash_since: None,
             report_root,
-            started: host_time("%Y-%m-%d %H:%M:%S"),
             report: None,
         }
     }
@@ -80,22 +78,117 @@ impl State {
     }
 }
 
-// ---------------------------------------------------------------- adb
+// ---------------------------------------------------------------- settings
 
-fn adb_path() -> String {
-    if let Ok(path) = std::env::var("ADB") {
-        return path;
+/// Paths and switches. Each comes from a flag, then an env var, then a default.
+#[derive(Debug, PartialEq)]
+struct Config {
+    adb: String,
+    /// None when ffmpeg is not set and not on PATH.
+    ffmpeg: Option<String>,
+    reports: PathBuf,
+    video: bool,
+    /// None means adb picks the device (it reads ANDROID_SERIAL itself).
+    serial: Option<String>,
+}
+
+static CONFIG: OnceLock<Config> = OnceLock::new();
+
+fn config() -> &'static Config {
+    CONFIG.get_or_init(|| load_config(&[], &env_var).expect("no flags to parse").0)
+}
+
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Reads the options before the command. Returns the config and where the command starts.
+fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<(Config, usize), String> {
+    let (mut adb, mut ffmpeg, mut reports, mut serial, mut no_video) = (None, None, None, None, false);
+    let mut i = 0;
+    while let Some(arg) = args.get(i).filter(|a| a.starts_with("--")) {
+        i += 1;
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        if name == "--no-video" {
+            no_video = true;
+            continue;
+        }
+        let slot = match name {
+            "--adb" => &mut adb,
+            "--ffmpeg" => &mut ffmpeg,
+            "--reports" => &mut reports,
+            "--serial" => &mut serial,
+            _ => return Err(format!("unknown option: {name}")),
+        };
+        let value = match inline {
+            Some(value) => value,
+            None => {
+                i += 1;
+                args.get(i - 1)
+                    .cloned()
+                    .ok_or_else(|| format!("{name} needs a value"))?
+            }
+        };
+        *slot = Some(value);
     }
+
+    let config = Config {
+        adb: adb.or_else(|| env("ADB")).unwrap_or_else(|| find_adb(env)),
+        ffmpeg: ffmpeg
+            .or_else(|| env("FFMPEG"))
+            .or_else(|| runs("ffmpeg").then(|| "ffmpeg".to_string())),
+        reports: PathBuf::from(
+            reports
+                .or_else(|| env("PHANTOMQA_REPORTS"))
+                .unwrap_or_else(|| "reports".into()),
+        ),
+        video: !no_video && env("PHANTOMQA_VIDEO").is_none_or(|v| v != "0"),
+        serial,
+    };
+    Ok((config, i))
+}
+
+/// adb from the Android SDK if ANDROID_HOME or ANDROID_SDK_ROOT is set, else adb on PATH.
+fn find_adb(env: &dyn Fn(&str) -> Option<String>) -> String {
+    let exe = if cfg!(windows) { "adb.exe" } else { "adb" };
     for var in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
-        if let Ok(home) = std::env::var(var) {
-            let path = format!("{home}/platform-tools/adb");
-            if std::path::Path::new(&path).exists() {
-                return path;
+        if let Some(home) = env(var) {
+            let path = Path::new(&home).join("platform-tools").join(exe);
+            if path.is_file() {
+                return path.to_string_lossy().into_owned();
             }
         }
     }
     "adb".into()
 }
+
+/// True if the program starts and exits cleanly with `-version`.
+fn runs(program: &str) -> bool {
+    first_line(program, "-version").is_ok()
+}
+
+/// First output line of `program arg`.
+fn first_line(program: &str, arg: &str) -> Result<String, String> {
+    let out = Command::new(program)
+        .arg(arg)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run {program}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{program} {arg} failed"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string())
+}
+
+// ---------------------------------------------------------------- adb
 
 /// Runs adb with a timeout and returns its stdout as text.
 fn adb(args: &[&str]) -> Result<String, String> {
@@ -104,13 +197,23 @@ fn adb(args: &[&str]) -> Result<String, String> {
 
 /// Runs adb with a timeout and returns its raw stdout.
 fn adb_bytes(args: &[&str]) -> Result<Vec<u8>, String> {
-    let mut child = Command::new(adb_path())
+    let config = config();
+    let mut command = Command::new(&config.adb);
+    if let Some(serial) = &config.serial {
+        command.args(["-s", serial]);
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot run adb ({}): {e}. Set ADB or ANDROID_HOME.", adb_path()))?;
+        .map_err(|e| {
+            format!(
+                "cannot run adb ({}): {e}. Install Android platform-tools, or set --adb, ADB or ANDROID_HOME.",
+                config.adb
+            )
+        })?;
 
     // Read both pipes on threads, or a big screen dump fills the pipe and adb blocks.
     let mut out_pipe = child.stdout.take().expect("stdout is piped");
@@ -133,7 +236,11 @@ fn adb_bytes(args: &[&str]) -> Result<Vec<u8>, String> {
             Ok(None) if start.elapsed() > ADB_TIMEOUT => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("adb {} timed out after {}s", args.join(" "), ADB_TIMEOUT.as_secs()));
+                return Err(format!(
+                    "adb {} timed out after {}s",
+                    args.join(" "),
+                    ADB_TIMEOUT.as_secs()
+                ));
             }
             Ok(None) => sleep(Duration::from_millis(10)),
             Err(e) => return Err(format!("adb {} failed: {e}", args.join(" "))),
@@ -154,7 +261,10 @@ fn adb_bytes(args: &[&str]) -> Result<Vec<u8>, String> {
 }
 
 fn valid_package(package: &str) -> bool {
-    !package.is_empty() && package.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+    !package.is_empty()
+        && package
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
 }
 
 fn screenshot() -> Result<Vec<u8>, String> {
@@ -222,7 +332,11 @@ struct Node {
 
 impl Node {
     fn get(&self, name: &str) -> &str {
-        self.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).unwrap_or("")
+        self.attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
     }
     fn is(&self, name: &str) -> bool {
         self.get(name) == "true"
@@ -273,7 +387,10 @@ fn parse_nodes(xml: &str) -> Vec<Node> {
         let Some(end) = end else { break };
         let tag = &body[..end];
         let self_closing = tag.trim_end().ends_with('/');
-        nodes.push(Node { depth, attrs: parse_attrs(tag) });
+        nodes.push(Node {
+            depth,
+            attrs: parse_attrs(tag),
+        });
         if !self_closing {
             depth += 1;
         }
@@ -373,7 +490,9 @@ fn parse_screen(xml: &str) -> (String, Vec<Element>) {
         let inside_clickable = ancestors.iter().any(|&a| nodes[a].clickable());
         ancestors.push(i);
 
-        let Some((l, t, r, b)) = parse_bounds(node.get("bounds")) else { continue };
+        let Some((l, t, r, b)) = parse_bounds(node.get("bounds")) else {
+            continue;
+        };
         if r <= l || b <= t {
             continue;
         }
@@ -630,8 +749,17 @@ fn parse_crashes(log: &str) -> Vec<Crash> {
             _ => None,
         };
         if let Some((kind, process)) = start {
-            let summary = if kind == "crash" { String::new() } else { l.msg.to_string() };
-            crashes.push(Crash { kind, process, summary, lines: vec![l.msg.to_string()] });
+            let summary = if kind == "crash" {
+                String::new()
+            } else {
+                l.msg.to_string()
+            };
+            crashes.push(Crash {
+                kind,
+                process,
+                summary,
+                lines: vec![l.msg.to_string()],
+            });
             current = Some((l.tag.to_string(), l.pid.to_string()));
             continue;
         }
@@ -743,57 +871,51 @@ fn crash_notice(state: &mut State) -> String {
 
 // ---------------------------------------------------------------- report
 
-/// Local time from the host `date` command, or epoch seconds if that fails.
-fn host_time(format: &str) -> String {
-    Command::new("date")
-        .arg(format!("+{format}"))
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            secs.to_string()
-        })
+fn device_name() -> Result<String, String> {
+    let out = adb(&[
+        "shell",
+        "getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk",
+    ])?;
+    let mut lines = out.lines().map(str::trim);
+    let model = lines.next().unwrap_or("?");
+    let version = lines.next().unwrap_or("?");
+    let sdk = lines.next().unwrap_or("?");
+    Ok(format!("{model}, Android {version} (API {sdk})"))
 }
 
-fn device_name() -> String {
-    match adb(&["shell", "getprop ro.product.model; getprop ro.build.version.release"]) {
-        Ok(out) => {
-            let mut lines = out.lines().map(str::trim);
-            let model = lines.next().unwrap_or("?");
-            let version = lines.next().unwrap_or("?");
-            format!("{model}, Android {version}")
-        }
-        Err(_) => "unknown".into(),
-    }
+/// The next free run number: one more than the highest "run-NNN" folder.
+fn next_run_number(root: &Path) -> usize {
+    let entries = fs::read_dir(root).into_iter().flatten().flatten();
+    let highest = entries
+        .filter_map(|e| e.file_name().to_str()?.strip_prefix("run-")?.parse::<usize>().ok())
+        .max();
+    highest.map_or(1, |n| n + 1)
 }
 
-/// The report folder. Creates it with report.md on the first bug.
+/// The report folder, reports/run-NNN. Creates it with report.md on first use.
 fn report_dir(state: &mut State) -> Result<PathBuf, String> {
     if let Some(report) = &state.report {
         return Ok(report.dir.clone());
     }
     let root = &state.report_root;
     fs::create_dir_all(root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
-    // "2026-11-11 10:11:19" -> "2026-11-11_10-11-19"
-    let stamp = state.started.replace(' ', "_").replace(':', "-");
-    let mut dir = root.join(&stamp);
-    let mut n = 1;
-    loop {
+    let mut run = next_run_number(root);
+    let dir = loop {
+        let dir = root.join(format!("run-{run:03}"));
         match fs::create_dir(&dir) {
-            Ok(()) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                n += 1;
-                dir = root.join(format!("{stamp}-{n}"));
-            }
+            Ok(()) => break dir,
+            // Another run took this number at the same moment.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => run += 1,
             Err(e) => return Err(format!("cannot create {}: {e}", dir.display())),
         }
-    }
-    let header = format!("# PhantomQA test report\n\n- Started: {}\n- Device: {}\n", state.started, device_name());
+    };
+    let device = device_name().unwrap_or_else(|_| "unknown".into());
+    let header = format!("# PhantomQA test report: run {run}\n\n- Device: {device}\n");
     fs::write(dir.join("report.md"), header).map_err(|e| format!("cannot write report.md: {e}"))?;
-    state.report = Some(Report { dir: dir.clone(), bugs: 0 });
+    state.report = Some(Report {
+        dir: dir.clone(),
+        bugs: 0,
+    });
     Ok(dir)
 }
 
@@ -822,13 +944,13 @@ struct Bug {
     body: String,
 }
 
-fn render_bug(n: usize, bug: &Bug, time: &str, history: &[String], attachments: &str) -> String {
+fn render_bug(n: usize, bug: &Bug, history: &[String], attachments: &str) -> String {
     let mut out = format!("\n## Bug {n}: {}\n\n", bug.title);
     out.push_str(&format!("- Severity: {}\n", bug.severity));
     if !bug.package.is_empty() {
         out.push_str(&format!("- App: {}\n", bug.package));
     }
-    out.push_str(&format!("- Time: {time}\n\n{}\n", bug.body.trim_end()));
+    out.push_str(&format!("\n{}\n", bug.body.trim_end()));
     if !history.is_empty() {
         out.push_str("\n**Recent actions** (newest last)\n\n");
         for action in history {
@@ -845,19 +967,18 @@ fn save_bug(state: &mut State, bug: &Bug, extra_log: &str) -> Result<usize, Stri
     let n = state.report.as_ref().map_or(0, |r| r.bugs) + 1;
     let name = format!("bug-{n:02}");
 
-    let shot = match screenshot().and_then(|png| {
-        fs::write(dir.join(format!("{name}.png")), png).map_err(|e| e.to_string())
-    }) {
-        Ok(()) => format!("![screenshot]({name}.png)"),
-        Err(e) => format!("(no screenshot: {e})"),
-    };
+    let shot =
+        match screenshot().and_then(|png| fs::write(dir.join(format!("{name}.png")), png).map_err(|e| e.to_string())) {
+            Ok(()) => format!("![screenshot]({name}.png)"),
+            Err(e) => format!("(no screenshot: {e})"),
+        };
     let log = format!("{extra_log}{}", app_log(&bug.package));
     let log_link = match fs::write(dir.join(format!("{name}.log")), log) {
         Ok(()) => format!("Log: [{name}.log]({name}.log)"),
         Err(e) => format!("(no log: {e})"),
     };
 
-    let section = render_bug(n, bug, &host_time("%H:%M:%S"), &state.history, &format!("{shot}\n\n{log_link}"));
+    let section = render_bug(n, bug, &state.history, &format!("{shot}\n\n{log_link}"));
     fs::OpenOptions::new()
         .append(true)
         .open(dir.join("report.md"))
@@ -877,7 +998,11 @@ fn save_crash(state: &mut State, crash: &Crash) -> Result<usize, String> {
         package: crash.process.split(':').next().unwrap_or("").to_string(),
         body: format!("Found automatically in logcat.\n\n```\n{lines}\n```\n"),
     };
-    save_bug(state, &bug, &format!("--- {} ---\n{lines}\n\n--- recent log ---\n", crash.kind))
+    save_bug(
+        state,
+        &bug,
+        &format!("--- {} ---\n{lines}\n\n--- recent log ---\n", crash.kind),
+    )
 }
 
 /// "1. Open the app" -> "Open the app"
@@ -929,14 +1054,26 @@ fn bug_from_args(args: &Value, package: &str) -> Result<Bug, String> {
         body.push_str(&format!("{}. {step}\n", i + 1));
     }
     body.push_str(&format!("\n**Expected:** {expected}\n\n**Actual:** {actual}\n"));
-    Ok(Bug { title, severity, package: package.to_string(), body })
+    Ok(Bug {
+        title,
+        severity,
+        package: package.to_string(),
+        body,
+    })
 }
 
 fn report_bug(state: &mut State, args: &Value) -> Result<String, String> {
     let bug = bug_from_args(args, &state.package)?;
     let n = save_bug(state, &bug, "")?;
-    let path = state.report.as_ref().map(|r| r.dir.join("report.md")).unwrap_or_default();
-    Ok(format!("Saved bug {n} to {}, with a screenshot and the app log.", path.display()))
+    let path = state
+        .report
+        .as_ref()
+        .map(|r| r.dir.join("report.md"))
+        .unwrap_or_default();
+    Ok(format!(
+        "Saved bug {n} to {}, with a screenshot and the app log.",
+        path.display()
+    ))
 }
 
 // ---------------------------------------------------------------- MCP server
@@ -1015,9 +1152,16 @@ fn tool_list() -> Value {
 fn call_tool(state: &mut State, params: &Value) -> Value {
     let name = params["name"].as_str().unwrap_or("");
     let args = &params["arguments"];
-    let int = |key: &str| args[key].as_i64().ok_or_else(|| format!("argument {key:?} must be an integer"));
+    let int = |key: &str| {
+        args[key]
+            .as_i64()
+            .ok_or_else(|| format!("argument {key:?} must be an integer"))
+    };
     let text = |key: &str| {
-        args[key].as_str().map(str::to_string).ok_or_else(|| format!("argument {key:?} must be a string"))
+        args[key]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("argument {key:?} must be a string"))
     };
     // Start the crash clock before the first action, so a crash it causes is not missed.
     if state.crash_since.is_none() {
@@ -1034,7 +1178,11 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
         _ => Err(format!("unknown tool: {name}")),
     };
     let checks_crashes = matches!(name, "screen" | "tap" | "type_text" | "back" | "launch_app" | "crashes");
-    let notice = if checks_crashes { crash_notice(state) } else { String::new() };
+    let notice = if checks_crashes {
+        crash_notice(state)
+    } else {
+        String::new()
+    };
 
     let (mut text, is_error) = match result {
         Ok(text) => (text, false),
@@ -1095,20 +1243,126 @@ fn serve_mcp(mut state: State) {
 
 // ---------------------------------------------------------------- CLI
 
-const USAGE: &str = "usage:
-  phantomqa mcp                 MCP server over stdio
-  phantomqa screen              print the current screen
-  phantomqa tap N               tap element N
-  phantomqa type N TEXT         tap element N and type TEXT
-  phantomqa back                press back
-  phantomqa launch PACKAGE      start an app
-  phantomqa crashes             list crashes and ANRs in the device's crash log";
+// ---------------------------------------------------------------- doctor
+
+/// Prints one line per check. Returns false if something required is missing.
+fn doctor() -> bool {
+    let config = config();
+    let mut ok = true;
+    let mut check = |required: bool, what: &str, result: Result<String, String>, fix: &str| match result {
+        Ok(detail) => println!("ok    {what}: {detail}"),
+        Err(error) => {
+            let status = if required { "FAIL" } else { "warn" };
+            println!("{status:<5} {what}: {error}\n      fix: {fix}");
+            ok &= !required;
+        }
+    };
+
+    let adb_version = adb(&["version"]).map(|out| out.lines().next().unwrap_or("").trim().to_string());
+    let adb_works = adb_version.is_ok();
+    check(
+        true,
+        "adb",
+        adb_version.map(|v| format!("{v} ({})", config.adb)),
+        "install Android platform-tools, or set --adb, ADB or ANDROID_HOME",
+    );
+    if adb_works {
+        let state = adb(&["get-state"]).map(|s| s.trim().to_string()).and_then(|s| {
+            if s == "device" {
+                Ok(s)
+            } else {
+                Err(format!("device is {s:?}"))
+            }
+        });
+        let device_works = state.is_ok();
+        check(
+            true,
+            "device",
+            state.and_then(|_| device_name()),
+            "start an emulator or connect a phone with USB debugging; with several devices, set --serial or ANDROID_SERIAL",
+        );
+        if device_works {
+            let screen = dump_xml().map(|xml| format!("works ({} elements on screen)", parse_screen(&xml).1.len()));
+            check(true, "screen reading", screen, "unlock the device screen and try again");
+            let recorder = adb(&["shell", "command -v screenrecord"])
+                .map(|p| p.trim().to_string())
+                .and_then(|p| if p.is_empty() { Err("not found".into()) } else { Ok(p) });
+            check(
+                false,
+                "screenrecord",
+                recorder,
+                "video needs screenrecord on the device; testing still works without it",
+            );
+        }
+    }
+
+    let ffmpeg = match &config.ffmpeg {
+        Some(path) => first_line(path, "-version").map(|v| format!("{v} ({path})")),
+        None => Err("not found".into()),
+    };
+    check(
+        false,
+        "ffmpeg",
+        ffmpeg,
+        "install ffmpeg, or set --ffmpeg or FFMPEG; without it, video stays as raw 1-minute parts",
+    );
+
+    let probe = config.reports.join(".phantomqa-write-test");
+    let writable = fs::create_dir_all(&config.reports)
+        .and_then(|_| fs::write(&probe, b"ok"))
+        .and_then(|_| fs::remove_file(&probe))
+        .map(|_| format!("{} is writable", config.reports.display()))
+        .map_err(|e| format!("{}: {e}", config.reports.display()));
+    check(
+        true,
+        "reports",
+        writable,
+        "set --reports or PHANTOMQA_REPORTS to a folder you can write to",
+    );
+
+    println!("info  video: {}", if config.video { "on" } else { "off" });
+    ok
+}
+
+// ---------------------------------------------------------------- CLI
+
+const USAGE: &str = "usage: phantomqa [options] <command>
+
+commands:
+  mcp                 MCP server over stdio (for Claude Code and other agents)
+  doctor              check adb, the device, ffmpeg and the reports folder
+  screen              print the current screen
+  tap N               tap element N
+  type N TEXT         tap element N and type TEXT
+  back                press back
+  launch PACKAGE      start an app
+  crashes             list crashes and ANRs in the device's crash log
+
+options (each also has an env var):
+  --adb PATH          adb binary            ADB  (default: $ANDROID_HOME/platform-tools/adb, then PATH)
+  --serial ID         device to use         ANDROID_SERIAL  (default: the only device connected)
+  --reports DIR       reports folder        PHANTOMQA_REPORTS  (default: reports)
+  --ffmpeg PATH       ffmpeg, optional      FFMPEG  (default: PATH)
+  --no-video          do not record video   PHANTOMQA_VIDEO=0";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let report_root = std::env::var_os("PHANTOMQA_REPORTS").map_or_else(|| PathBuf::from("reports"), PathBuf::from);
-    let mut state = State::new(report_root);
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return;
+    }
+    let start = match load_config(&args, &env_var) {
+        Ok((config, start)) => {
+            let _ = CONFIG.set(config);
+            start
+        }
+        Err(error) => {
+            eprintln!("error: {error}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    let args: Vec<&str> = args[start..].iter().map(String::as_str).collect();
+    let mut state = State::new(config().reports.clone());
     let id = |s: &str| s.parse::<i64>().map_err(|_| format!("not a number: {s}"));
 
     let result = match args[..] {
@@ -1116,6 +1370,7 @@ fn main() {
             serve_mcp(state);
             return;
         }
+        ["doctor"] => std::process::exit(if doctor() { 0 } else { 1 }),
         ["crashes"] => read_crash_log(None).map(|log| {
             let crashes = parse_crashes(&log);
             if crashes.is_empty() {
@@ -1197,7 +1452,10 @@ mod tests {
 
     #[test]
     fn unescapes_entities() {
-        assert_eq!(unescape("a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#x27;"), "a & b <c> \"d\" 'e'");
+        assert_eq!(
+            unescape("a &amp; b &lt;c&gt; &quot;d&quot; &#39;e&#x27;"),
+            "a & b <c> \"d\" 'e'"
+        );
         assert_eq!(unescape("50% & more"), "50% & more");
         assert_eq!(unescape("&bogus; &"), "&bogus; &");
     }
@@ -1240,7 +1498,8 @@ mod tests {
     #[test]
     fn mcp_handshake_and_errors() {
         let mut state = test_state();
-        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}});
+        let init =
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}});
         let reply = handle_message(&mut state, &init).unwrap();
         assert_eq!(reply["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(reply["result"]["serverInfo"]["name"], "phantomqa");
@@ -1287,7 +1546,11 @@ mod tests {
             crashes[0].summary,
             "android.app.RemoteServiceException$CrashedByAdbException: shell-induced crash"
         );
-        assert_eq!(crashes[0].lines.len(), 4, "the other process's line is not part of this crash");
+        assert_eq!(
+            crashes[0].lines.len(),
+            4,
+            "the other process's line is not part of this crash"
+        );
         assert!(crashes[0].lines[3].starts_with("\tat android.app"));
 
         assert_eq!(crashes[1].kind, "ANR");
@@ -1297,7 +1560,10 @@ mod tests {
         assert_eq!(crashes[2].kind, "native crash");
         assert_eq!(crashes[2].process, "com.example.game");
         assert_eq!(crashes[2].lines.len(), 3);
-        assert_eq!(crashes[2].title(), format!("Native crash in com.example.game: {}", crashes[2].lines[0]));
+        assert_eq!(
+            crashes[2].title(),
+            format!("Native crash in com.example.game: {}", crashes[2].lines[0])
+        );
 
         assert!(parse_crashes("--------- beginning of crash\n").is_empty());
 
@@ -1333,7 +1599,8 @@ mod tests {
             "**Steps**\n\n1. Open the app\n2. Tap \"Log in\"\n\n**Expected:** An error message\n\n**Actual:** Nothing happens\n"
         );
 
-        let as_text = json!({"title": "t", "steps": "1) First\n2) Second", "expected": "e", "actual": "a", "severity": "HIGH"});
+        let as_text =
+            json!({"title": "t", "steps": "1) First\n2) Second", "expected": "e", "actual": "a", "severity": "HIGH"});
         let bug = bug_from_args(&as_text, "").unwrap();
         assert_eq!(bug.severity, "high");
         assert!(bug.body.contains("1. First\n2. Second\n"));
@@ -1357,11 +1624,14 @@ mod tests {
             package: "com.example.app".into(),
             body: "**Steps**\n\n1. Open\n".into(),
         };
-        let history = vec!["launch_app com.example.app".to_string(), "tap [3] Button \"Log in\"".to_string()];
-        let text = render_bug(2, &bug, "15:06:12", &history, "![screenshot](bug-02.png)");
+        let history = vec![
+            "launch_app com.example.app".to_string(),
+            "tap [3] Button \"Log in\"".to_string(),
+        ];
+        let text = render_bug(2, &bug, &history, "![screenshot](bug-02.png)");
         assert_eq!(
             text,
-            "\n## Bug 2: Login does nothing\n\n- Severity: high\n- App: com.example.app\n- Time: 15:06:12\n\n\
+            "\n## Bug 2: Login does nothing\n\n- Severity: high\n- App: com.example.app\n\n\
              **Steps**\n\n1. Open\n\n**Recent actions** (newest last)\n\n- launch_app com.example.app\n\
              - tap [3] Button \"Log in\"\n\n![screenshot](bug-02.png)\n"
         );
@@ -1378,16 +1648,89 @@ mod tests {
     }
 
     #[test]
-    fn report_folders_never_collide() {
+    fn numbers_report_folders() {
         let root = std::env::temp_dir().join(format!("phantomqa-test-{}", std::process::id()));
         let mut a = State::new(root.clone());
         let mut b = State::new(root.clone());
         let dir_a = report_dir(&mut a).unwrap();
         let dir_b = report_dir(&mut b).unwrap();
-        assert_ne!(dir_a, dir_b);
+        assert_eq!(dir_a, root.join("run-001"));
+        assert_eq!(dir_b, root.join("run-002"));
         assert_eq!(report_dir(&mut a).unwrap(), dir_a, "same run reuses its folder");
         let header = fs::read_to_string(dir_a.join("report.md")).unwrap();
-        assert!(header.starts_with("# PhantomQA test report\n"));
+        assert!(header.starts_with("# PhantomQA test report: run 1\n"));
+
+        fs::create_dir(root.join("run-041")).unwrap();
+        fs::create_dir(root.join("notes")).unwrap();
+        assert_eq!(next_run_number(&root), 42);
+        assert_eq!(next_run_number(&root.join("missing")), 1);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reads_options_before_the_command() {
+        let no_env = |_: &str| None;
+        let (config, start) = load_config(
+            &args(&[
+                "--adb",
+                "/x/adb",
+                "--reports=out",
+                "--serial",
+                "emu-1",
+                "--no-video",
+                "tap",
+                "3",
+            ]),
+            &no_env,
+        )
+        .unwrap();
+        assert_eq!(start, 6);
+        assert_eq!(config.adb, "/x/adb");
+        assert_eq!(config.reports, PathBuf::from("out"));
+        assert_eq!(config.serial.as_deref(), Some("emu-1"));
+        assert!(!config.video);
+
+        // Text after the command is never read as an option.
+        let (_, start) = load_config(&args(&["type", "2", "--adb"]), &no_env).unwrap();
+        assert_eq!(start, 0);
+
+        assert!(load_config(&args(&["--adb"]), &no_env).is_err());
+        assert!(load_config(&args(&["--nope", "screen"]), &no_env).is_err());
+    }
+
+    #[test]
+    fn options_win_over_env_vars() {
+        let env = |name: &str| match name {
+            "ADB" => Some("/env/adb".to_string()),
+            "FFMPEG" => Some("/env/ffmpeg".to_string()),
+            "PHANTOMQA_REPORTS" => Some("env-reports".to_string()),
+            "PHANTOMQA_VIDEO" => Some("0".to_string()),
+            _ => None,
+        };
+        let (config, _) = load_config(&[], &env).unwrap();
+        assert_eq!(config.adb, "/env/adb");
+        assert_eq!(config.ffmpeg.as_deref(), Some("/env/ffmpeg"));
+        assert_eq!(config.reports, PathBuf::from("env-reports"));
+        assert!(!config.video);
+
+        let (config, _) = load_config(&args(&["--adb", "/flag/adb", "--ffmpeg", "/flag/ffmpeg"]), &env).unwrap();
+        assert_eq!(config.adb, "/flag/adb");
+        assert_eq!(config.ffmpeg.as_deref(), Some("/flag/ffmpeg"));
+
+        let sdk = std::env::temp_dir().join(format!("phantomqa-sdk-{}", std::process::id()));
+        let exe = if cfg!(windows) { "adb.exe" } else { "adb" };
+        fs::create_dir_all(sdk.join("platform-tools")).unwrap();
+        fs::write(sdk.join("platform-tools").join(exe), b"").unwrap();
+        let sdk_env = |name: &str| (name == "ANDROID_HOME").then(|| sdk.to_string_lossy().into_owned());
+        assert_eq!(
+            find_adb(&sdk_env),
+            sdk.join("platform-tools").join(exe).to_string_lossy()
+        );
+        assert_eq!(find_adb(&|_: &str| None), "adb");
+        fs::remove_dir_all(sdk).unwrap();
     }
 }

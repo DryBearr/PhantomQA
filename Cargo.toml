@@ -2,6 +2,12 @@
 name = "phantomqa"
 version = "0.1.0"
 edition = "2024"
+description = "AI agents test Android apps on an emulator and report what breaks"
+license = "MIT"
+repository = "https://github.com/DryBearr/PhantomQA"
+readme = "README.md"
+keywords = ["android", "testing", "mcp", "qa", "adb"]
+categories = ["development-tools::testing", "command-line-utilities"]
 
 [dependencies]
 serde_json = "1.0.154"
