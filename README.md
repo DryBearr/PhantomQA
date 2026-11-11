@@ -2,7 +2,7 @@
 
 AI agents test Android apps on an emulator and report what breaks.
 
-PhantomQA is one small Rust binary. It lets an AI agent (for example Claude Code) see the screen, tap, type and go back, like a person. It catches crashes by itself, and the agent files bug reports with a screenshot and the app log. Everything goes through `adb`.
+PhantomQA is one small Rust binary. It lets an AI agent (for example Claude Code) see the screen, tap, type and go back, like a person. It catches crashes by itself, and the agent files bug reports with a screenshot, a video clip and the app log. Everything goes through `adb`.
 
 ## Requirements
 
@@ -11,7 +11,7 @@ PhantomQA is one small Rust binary. It lets an AI agent (for example Claude Code
 | [Rust](https://rustup.rs) | to build | |
 | `adb` from [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) | yes | talks to the device |
 | An Android emulator or phone with USB debugging | yes | the app under test runs here |
-| [ffmpeg](https://ffmpeg.org) | no | video clips per bug (planned) |
+| [ffmpeg](https://ffmpeg.org) | no | joins video parts into one clip per bug and `session.mp4` |
 
 Check your setup:
 
@@ -76,18 +76,31 @@ phantomqa crashes                       # list crashes and ANRs in the device's 
 
 ## Crashes and bug reports
 
-- After every action, PhantomQA reads the device's crash log. A new crash, native crash or ANR is shown to the agent and saved to the report automatically.
+- After every action, PhantomQA reads the device's crash log. A new crash, native crash or ANR of the app under test is shown to the agent and saved to the report automatically.
+- The same crash is saved once, even in a crash loop. Crashes of other apps are mentioned to the agent, not saved.
 - The agent calls `report_bug` for other problems it finds.
-- Each bug gets a screenshot, the app's log and the list of recent actions, so a person can follow the same path.
+- Each bug gets a screenshot, a video clip, the app's log and the list of recent actions, so a person can follow the same path. Text typed into password fields is hidden in the report.
 
 Each test run gets the next numbered folder:
 
 ```
 reports/run-001/
-  report.md      one section per bug
+  report.md      one section per bug, and the video at the end
   bug-01.png     screenshot
+  bug-01.mp4     video of the last 15-60 seconds before the bug
   bug-01.log     crash lines and the app's recent log
+  session.mp4    the whole session
 ```
+
+## Video
+
+In an MCP session, PhantomQA records the screen with `screenrecord` in 30-second parts. When a bug is saved, the current part ends there, so the clip shows what led to the bug. When the agent closes the session, the parts are joined into `session.mp4`.
+
+- Without ffmpeg, a clip of one part is still made. Clips that need two parts, and the session, stay as parts in `video/`, linked from the report.
+- Android only records a frame when the screen changes, so still moments are shorter in the video than in real time.
+- Screens that block screenshots (some banking apps, password screens) record as black.
+- If PhantomQA is killed instead of closed, `session.mp4` is not made; the parts stay in `video/`.
+- Turn video off with `--no-video`, screenshots with `--no-screenshots`.
 
 ## Options
 
@@ -100,10 +113,14 @@ Put options before the command. Each option also has an env var, which is handy 
 | `--reports DIR` | `PHANTOMQA_REPORTS` | `reports` |
 | `--ffmpeg PATH` | `FFMPEG` | `ffmpeg` on PATH |
 | `--no-video` | `PHANTOMQA_VIDEO=0` | video on |
+| `--no-screenshots` | `PHANTOMQA_SCREENSHOTS=0` | screenshots on |
+
+Example: `phantomqa --serial emulator-5554 --reports ~/qa --no-video mcp`
 
 ## Limits
 
 - `type_text` types printable ASCII only.
+- No swipe or scroll yet, so long lists can only be tested as far as they show.
 - Apps that draw their own UI (games, Flutter without semantics) show few or no elements.
 - Reading the screen with `uiautomator dump` takes about 1-3 seconds.
 

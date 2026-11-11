@@ -8,12 +8,12 @@
 
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::sleep;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, mpsc};
+use std::thread::{JoinHandle, sleep};
 use std::time::{Duration, Instant};
 
 /// How long to wait after an action before reading the screen again.
@@ -49,8 +49,20 @@ struct State {
     /// Logcat time ("sssss.mmm") to read crashes from. None until the first check.
     crash_since: Option<String>,
     report_root: PathBuf,
-    /// Created on the first bug.
+    /// Created on the first bug, or when video starts.
     report: Option<Report>,
+    /// True once the first tool call decided about video.
+    video_checked: bool,
+    /// The running recording, if video is on.
+    video: Option<Video>,
+    /// Why there is no video, for the report.
+    video_off: Option<String>,
+    /// Apps started with launch_app. Crashes of other apps are not saved as bugs.
+    apps: Vec<String>,
+    /// Crashes already saved, by title, with their bug number. A crash loop is saved once.
+    saved_crashes: Vec<(String, usize)>,
+    /// The crash check failed once already; do not repeat the same warning after every action.
+    crash_check_failed: bool,
 }
 
 struct Report {
@@ -67,6 +79,12 @@ impl State {
             crash_since: None,
             report_root,
             report: None,
+            video_checked: false,
+            video: None,
+            video_off: None,
+            apps: Vec::new(),
+            saved_crashes: Vec::new(),
+            crash_check_failed: false,
         }
     }
 
@@ -88,6 +106,7 @@ struct Config {
     ffmpeg: Option<String>,
     reports: PathBuf,
     video: bool,
+    screenshots: bool,
     /// None means adb picks the device (it reads ANDROID_SERIAL itself).
     serial: Option<String>,
 }
@@ -104,17 +123,30 @@ fn env_var(name: &str) -> Option<String> {
 
 /// Reads the options before the command. Returns the config and where the command starts.
 fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<(Config, usize), String> {
-    let (mut adb, mut ffmpeg, mut reports, mut serial, mut no_video) = (None, None, None, None, false);
+    let (mut adb, mut ffmpeg, mut reports, mut serial) = (None, None, None, None);
+    let (mut no_video, mut no_screenshots) = (false, false);
     let mut i = 0;
     while let Some(arg) = args.get(i).filter(|a| a.starts_with("--")) {
         i += 1;
+        // "--" ends the options.
+        if arg == "--" {
+            break;
+        }
         let (name, inline) = match arg.split_once('=') {
             Some((name, value)) => (name, Some(value.to_string())),
             None => (arg.as_str(), None),
         };
-        if name == "--no-video" {
-            no_video = true;
-            continue;
+        match name {
+            "--no-video" | "--no-screenshots" if inline.is_some() => return Err(format!("{name} takes no value")),
+            "--no-video" => {
+                no_video = true;
+                continue;
+            }
+            "--no-screenshots" => {
+                no_screenshots = true;
+                continue;
+            }
+            _ => {}
         }
         let slot = match name {
             "--adb" => &mut adb,
@@ -127,11 +159,16 @@ fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<
             Some(value) => value,
             None => {
                 i += 1;
+                // "--reports --no-video" is a missing value, not a folder named "--no-video".
                 args.get(i - 1)
+                    .filter(|v| !v.starts_with("--"))
                     .cloned()
-                    .ok_or_else(|| format!("{name} needs a value"))?
+                    .unwrap_or_default()
             }
         };
+        if value.trim().is_empty() {
+            return Err(format!("{name} needs a value"));
+        }
         *slot = Some(value);
     }
 
@@ -140,12 +177,17 @@ fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<
         ffmpeg: ffmpeg
             .or_else(|| env("FFMPEG"))
             .or_else(|| runs("ffmpeg").then(|| "ffmpeg".to_string())),
-        reports: PathBuf::from(
-            reports
-                .or_else(|| env("PHANTOMQA_REPORTS"))
-                .unwrap_or_else(|| "reports".into()),
-        ),
+        // Absolute, so messages and links stay right whatever the working folder is later.
+        reports: {
+            let reports = PathBuf::from(
+                reports
+                    .or_else(|| env("PHANTOMQA_REPORTS"))
+                    .unwrap_or_else(|| "reports".into()),
+            );
+            std::path::absolute(&reports).unwrap_or(reports)
+        },
         video: !no_video && env("PHANTOMQA_VIDEO").is_none_or(|v| v != "0"),
+        screenshots: !no_screenshots && env("PHANTOMQA_SCREENSHOTS").is_none_or(|v| v != "0"),
         serial,
     };
     Ok((config, i))
@@ -195,25 +237,49 @@ fn adb(args: &[&str]) -> Result<String, String> {
     adb_bytes(args).map(|out| String::from_utf8_lossy(&out).into_owned())
 }
 
-/// Runs adb with a timeout and returns its raw stdout.
-fn adb_bytes(args: &[&str]) -> Result<Vec<u8>, String> {
+/// An adb command for the chosen device.
+fn adb_command() -> Command {
     let config = config();
     let mut command = Command::new(&config.adb);
     if let Some(serial) = &config.serial {
         command.args(["-s", serial]);
     }
-    let mut child = command
+    command
+}
+
+fn adb_missing(error: std::io::Error) -> String {
+    format!(
+        "cannot run adb ({}): {error}. Install Android platform-tools, or set --adb, ADB or ANDROID_HOME.",
+        config().adb
+    )
+}
+
+/// Waits for a process and kills it after `timeout`.
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus, String> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if start.elapsed() > timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            Ok(None) => sleep(Duration::from_millis(10)),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// Runs adb with a timeout and returns its raw stdout.
+fn adb_bytes(args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut child = adb_command()
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| {
-            format!(
-                "cannot run adb ({}): {e}. Install Android platform-tools, or set --adb, ADB or ANDROID_HOME.",
-                config.adb
-            )
-        })?;
+        .map_err(adb_missing)?;
 
     // Read both pipes on threads, or a big screen dump fills the pipe and adb blocks.
     let mut out_pipe = child.stdout.take().expect("stdout is piped");
@@ -229,23 +295,7 @@ fn adb_bytes(args: &[&str]) -> Result<Vec<u8>, String> {
         buf
     });
 
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if start.elapsed() > ADB_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "adb {} timed out after {}s",
-                    args.join(" "),
-                    ADB_TIMEOUT.as_secs()
-                ));
-            }
-            Ok(None) => sleep(Duration::from_millis(10)),
-            Err(e) => return Err(format!("adb {} failed: {e}", args.join(" "))),
-        }
-    };
+    let status = wait_with_timeout(&mut child, ADB_TIMEOUT).map_err(|e| format!("adb {}: {e}", args.join(" ")))?;
 
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
@@ -303,7 +353,9 @@ fn dump_xml() -> Result<String, String> {
                 }
             }
         }
-        let cmd = "uiautomator dump /sdcard/phantomqa-dump.xml >/dev/null && cat /sdcard/phantomqa-dump.xml";
+        // /data/local/tmp is always writable by adb shell; /sdcard is not on every device.
+        let cmd =
+            "uiautomator dump /data/local/tmp/phantomqa-dump.xml >/dev/null && cat /data/local/tmp/phantomqa-dump.xml";
         match adb(&["exec-out", cmd]) {
             Ok(out) => match extract_hierarchy(&out) {
                 Some(xml) => return Ok(xml),
@@ -318,7 +370,11 @@ fn dump_xml() -> Result<String, String> {
 /// Cuts the `<hierarchy>...</hierarchy>` part out of the uiautomator output.
 fn extract_hierarchy(out: &str) -> Option<String> {
     let start = out.find("<hierarchy")?;
-    let end = out.rfind("</hierarchy>")? + "</hierarchy>".len();
+    let end = match out.rfind("</hierarchy>") {
+        Some(end) => end + "</hierarchy>".len(),
+        // An empty screen is written as <hierarchy rotation="0" />.
+        None => out[start..].find("/>")? + start + 2,
+    };
     (start < end).then(|| out[start..end].to_string())
 }
 
@@ -467,11 +523,16 @@ fn parse_bounds(s: &str) -> Option<(i32, i32, i32, i32)> {
 }
 
 fn shorten(s: &str) -> String {
-    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= MAX_LABEL {
-        return one_line;
+    one_line(s, MAX_LABEL)
+}
+
+/// Joins all whitespace into single spaces and cuts the text at `max` characters.
+fn one_line(s: &str, max: usize) -> String {
+    let line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= max {
+        return line;
     }
-    let cut: String = one_line.chars().take(MAX_LABEL - 1).collect();
+    let cut: String = line.chars().take(max.saturating_sub(1)).collect();
     format!("{cut}…")
 }
 
@@ -615,25 +676,46 @@ fn tap(state: &mut State, id: i64) -> Result<String, String> {
     read_screen(state)
 }
 
-/// `input text` reads "%s" as a space and cannot type non-ASCII characters.
-fn input_text_arg(text: &str) -> Result<String, String> {
+/// Arguments for one or more `input text` calls. `input text` reads "%s" as a space and
+/// cannot type non-ASCII characters, so a literal "%s" is typed as "%" and "s" in two calls.
+fn input_text_args(text: &str) -> Result<Vec<String>, String> {
     if text.is_empty() {
         return Err("text is empty".into());
     }
     if let Some(c) = text.chars().find(|c| !c.is_ascii() || c.is_ascii_control()) {
         return Err(format!("cannot type {c:?}: only printable ASCII is supported for now"));
     }
-    Ok(shell_quote(&text.replace(' ', "%s")))
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for c in text.chars() {
+        if c == 's' && current.ends_with('%') {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push(c);
+    }
+    chunks.push(current);
+    Ok(chunks
+        .iter()
+        .map(|chunk| shell_quote(&chunk.replace(' ', "%s")))
+        .collect())
 }
 
 fn type_text(state: &mut State, id: i64, text: &str) -> Result<String, String> {
-    let arg = input_text_arg(text)?;
+    let args = input_text_args(text)?;
     let e = element(state, id)?;
-    state.remember(format!("type_text {}: {text:?}", describe(id, &e)));
+    // Keep passwords out of the report.
+    let shown = if e.flags.contains(&"password") {
+        "(hidden)".to_string()
+    } else {
+        format!("{text:?}")
+    };
+    state.remember(format!("type_text {}: {shown}", describe(id, &e)));
     let (x, y) = e.center;
     adb(&["shell", "input", "tap", &x.to_string(), &y.to_string()])?;
     sleep(Duration::from_millis(300));
-    adb(&["shell", "input", "text", &arg])?;
+    for arg in &args {
+        adb(&["shell", "input", "text", arg])?;
+    }
     sleep(SETTLE);
     read_screen(state)
 }
@@ -650,6 +732,9 @@ fn launch_app(state: &mut State, package: &str) -> Result<String, String> {
         return Err(format!("not a valid package name: {package:?}"));
     }
     state.remember(format!("launch_app {package}"));
+    if !state.apps.iter().any(|a| a == package) {
+        state.apps.push(package.to_string());
+    }
     let resolved = adb(&[
         "shell",
         "cmd",
@@ -661,14 +746,45 @@ fn launch_app(state: &mut State, package: &str) -> Result<String, String> {
         "-c",
         "android.intent.category.LAUNCHER",
         package,
-    ])?;
-    let component = resolved.lines().map(str::trim).rfind(|l| l.contains('/'));
-    let Some(component) = component else {
-        return Err(format!("{package} is not installed or has no launcher screen"));
-    };
-    let started = adb(&["shell", "am", "start", "-W", "-n", &shell_quote(component)])?;
-    if let Some(line) = started.lines().find(|l| l.starts_with("Error")) {
-        return Err(format!("could not start {package}: {}", line.trim()));
+    ]);
+    // `cmd package` needs Android 7. Older devices, and errors, fall back to monkey.
+    let component = resolved.ok().and_then(|out| {
+        out.lines()
+            .map(str::trim)
+            .rfind(|l| l.contains('/'))
+            .map(str::to_string)
+    });
+    match component {
+        Some(component) => {
+            let started = adb(&["shell", "am", "start", "-W", "-n", &shell_quote(&component)])?;
+            if let Some(line) = started.lines().find(|l| l.starts_with("Error")) {
+                return Err(format!("could not start {package}: {}", line.trim()));
+            }
+        }
+        None => {
+            // Not installed is the common case; say so plainly.
+            let installed = adb(&["shell", "pm", "path", package]).is_ok_and(|p| p.contains("package:"));
+            if !installed {
+                return Err(format!("{package} is not installed"));
+            }
+            // monkey exits with an error when there is nothing to start, so read its output either way.
+            let out = adb(&[
+                "shell",
+                "monkey",
+                "-p",
+                package,
+                "-c",
+                "android.intent.category.LAUNCHER",
+                "1",
+            ])
+            .unwrap_or_else(|e| e);
+            if out.contains("No activities found") {
+                return Err(format!("{package} has no launcher screen to start"));
+            }
+            if !out.contains("Events injected") {
+                return Err(format!("could not start {package}: {}", one_line(&out, 200)));
+            }
+        }
     }
     sleep(SETTLE);
     read_screen(state)
@@ -692,7 +808,17 @@ impl Crash {
             "native crash" => "Native crash",
             other => other,
         };
-        format!("{kind} in {}: {}", self.process, self.summary)
+        let process = if self.process.is_empty() {
+            "unknown process"
+        } else {
+            &self.process
+        };
+        let summary = if self.summary.is_empty() {
+            "app stopped"
+        } else {
+            &self.summary
+        };
+        format!("{kind} in {process}: {}", one_line(summary, 150))
     }
 }
 
@@ -854,15 +980,41 @@ fn render_crash(crash: &Crash) -> String {
 /// Checks for new crashes, saves each to the report, and returns a notice for the agent ("" if none).
 fn crash_notice(state: &mut State) -> String {
     let crashes = match new_crashes(state) {
-        Ok(crashes) => crashes,
-        Err(e) => return format!("\n(could not check for crashes: {e})\n"),
+        Ok(crashes) => {
+            state.crash_check_failed = false;
+            crashes
+        }
+        // Say it once, not after every action.
+        Err(_) if state.crash_check_failed => return String::new(),
+        Err(e) => {
+            state.crash_check_failed = true;
+            return format!("\n(could not check for crashes: {e})\n");
+        }
     };
+    handle_crashes(state, &crashes)
+}
+
+/// Saves new crashes of the tested apps and describes all of them for the agent.
+fn handle_crashes(state: &mut State, crashes: &[Crash]) -> String {
     let mut out = String::new();
-    for crash in &crashes {
+    for crash in crashes {
+        let app = crash.process.split(':').next().unwrap_or("");
+        if !state.apps.is_empty() && !state.apps.iter().any(|a| a == app) {
+            out.push_str(&format!("\n(another app crashed, not saved: {})\n", crash.title()));
+            continue;
+        }
+        let title = crash.title();
+        if let Some((_, n)) = state.saved_crashes.iter().find(|(t, _)| *t == title) {
+            out.push_str(&format!("\n!! The same crash happened again (bug {n}): {title}\n"));
+            continue;
+        }
         out.push('\n');
         out.push_str(&render_crash(crash));
         match save_crash(state, crash) {
-            Ok(n) => out.push_str(&format!("   Saved to the report as bug {n}. Do not report it again.\n")),
+            Ok(n) => {
+                state.saved_crashes.push((title, n));
+                out.push_str(&format!("   Saved to the report as bug {n}. Do not report it again.\n"));
+            }
             Err(e) => out.push_str(&format!("   Could not save it to the report: {e}\n")),
         }
     }
@@ -964,22 +1116,31 @@ fn render_bug(n: usize, bug: &Bug, history: &[String], attachments: &str) -> Str
 /// Saves one bug: a section in report.md, a screenshot and the log. Returns the bug number.
 fn save_bug(state: &mut State, bug: &Bug, extra_log: &str) -> Result<usize, String> {
     let dir = report_dir(state)?;
+    // The folder may have been deleted while the session runs.
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let n = state.report.as_ref().map_or(0, |r| r.bugs) + 1;
     let name = format!("bug-{n:02}");
 
-    let shot =
-        match screenshot().and_then(|png| fs::write(dir.join(format!("{name}.png")), png).map_err(|e| e.to_string())) {
+    let mut attachments = Vec::new();
+    if config().screenshots {
+        let saved =
+            screenshot().and_then(|png| fs::write(dir.join(format!("{name}.png")), png).map_err(|e| e.to_string()));
+        attachments.push(match saved {
             Ok(()) => format!("![screenshot]({name}.png)"),
             Err(e) => format!("(no screenshot: {e})"),
-        };
+        });
+    }
     let log = format!("{extra_log}{}", app_log(&bug.package));
-    let log_link = match fs::write(dir.join(format!("{name}.log")), log) {
+    attachments.push(match fs::write(dir.join(format!("{name}.log")), log) {
         Ok(()) => format!("Log: [{name}.log]({name}.log)"),
         Err(e) => format!("(no log: {e})"),
-    };
-
-    let section = render_bug(n, bug, &state.history, &format!("{shot}\n\n{log_link}"));
+    });
+    if let Some(video) = &mut state.video {
+        attachments.push(video_clip(video, &dir, &name));
+    }
+    let section = render_bug(n, bug, &state.history, &attachments.join("\n\n"));
     fs::OpenOptions::new()
+        .create(true)
         .append(true)
         .open(dir.join("report.md"))
         .and_then(|mut file| file.write_all(section.as_bytes()))
@@ -996,13 +1157,22 @@ fn save_crash(state: &mut State, crash: &Crash) -> Result<usize, String> {
         title: crash.title(),
         severity: "critical".into(),
         package: crash.process.split(':').next().unwrap_or("").to_string(),
-        body: format!("Found automatically in logcat.\n\n```\n{lines}\n```\n"),
+        body: format!("Found automatically in logcat.\n\n{}", code_block(&lines)),
     };
     save_bug(
         state,
         &bug,
         &format!("--- {} ---\n{lines}\n\n--- recent log ---\n", crash.kind),
     )
+}
+
+/// A Markdown code block whose fence cannot clash with the text inside it.
+fn code_block(text: &str) -> String {
+    let mut fence = String::from("```");
+    while text.contains(&fence) {
+        fence.push('`');
+    }
+    format!("{fence}\n{text}\n{fence}\n")
 }
 
 /// "1. Open the app" -> "Open the app"
@@ -1025,7 +1195,8 @@ fn bug_from_args(args: &Value, package: &str) -> Result<Bug, String> {
             .map(str::to_string)
             .ok_or_else(|| format!("{key:?} is required"))
     };
-    let title = text("title")?;
+    // A title is one heading line.
+    let title = one_line(&text("title")?, 150);
     let expected = text("expected")?;
     let actual = text("actual")?;
 
@@ -1070,10 +1241,422 @@ fn report_bug(state: &mut State, args: &Value) -> Result<String, String> {
         .as_ref()
         .map(|r| r.dir.join("report.md"))
         .unwrap_or_default();
-    Ok(format!(
-        "Saved bug {n} to {}, with a screenshot and the app log.",
-        path.display()
-    ))
+    Ok(format!("Saved bug {n} to {}.", path.display()))
+}
+
+// ---------------------------------------------------------------- video
+
+/// Length of one recorded part. Short parts keep bug clips short. Android allows up to 180 s.
+const PART_SECONDS: u64 = 30;
+/// A bug clip also gets the part before it when the last part is shorter than this.
+const MIN_CLIP_SECONDS: f64 = 15.0;
+const VIDEO_BIT_RATE: u32 = 1_000_000;
+/// Always writable by `adb shell`, unlike /sdcard on some devices.
+const DEVICE_TMP: &str = "/data/local/tmp";
+/// Video stops after this many failed parts in a row.
+const MAX_PART_FAILURES: usize = 3;
+/// How long a bug waits for the video part that shows it.
+const CUT_TIMEOUT: Duration = Duration::from_secs(20);
+const FFMPEG_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One recorded part, pulled to the host.
+struct Part {
+    file: PathBuf,
+    seconds: f64,
+}
+
+/// What the recording thread and the main thread share.
+#[derive(Default)]
+struct Recorder {
+    parts: Vec<Part>,
+    /// Parts that ended, kept or dropped. A cut waits for this to grow.
+    finished: usize,
+    /// Device PID of the running screenrecord.
+    pid: Option<String>,
+    /// Counts cuts, so a part cut right after it started is not counted as a failure.
+    cuts: usize,
+    stop: bool,
+    /// The recording thread has ended.
+    done: bool,
+    error: Option<String>,
+}
+
+type Shared = Arc<(Mutex<Recorder>, Condvar)>;
+
+struct Video {
+    shared: Shared,
+    thread: Option<JoinHandle<()>>,
+    /// run-NNN/video, where the parts go.
+    dir: PathBuf,
+    /// The report links to raw parts, so they must be kept.
+    parts_linked: bool,
+}
+
+fn lock(shared: &Shared) -> MutexGuard<'_, Recorder> {
+    shared.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Starts recording for an MCP session, or notes why video is off.
+fn start_video(state: &mut State) {
+    state.video_checked = true;
+    if !config().video {
+        state.video_off = Some("turned off with --no-video or PHANTOMQA_VIDEO=0".into());
+        return;
+    }
+    match try_start_video(state) {
+        Ok(video) => state.video = Some(video),
+        Err(e) => state.video_off = Some(e),
+    }
+}
+
+fn try_start_video(state: &mut State) -> Result<Video, String> {
+    let found = adb(&["shell", "command -v screenrecord"]).unwrap_or_default();
+    if found.trim().is_empty() {
+        return Err("screenrecord is not available on the device".into());
+    }
+    // Remove parts left by a session that was killed, unless a session is recording now.
+    // "[/]" keeps pgrep from matching its own shell.
+    let cleanup = format!("pgrep -f '[/]data/local/tmp/phantomqa-' >/dev/null || rm -f {DEVICE_TMP}/phantomqa-*.mp4");
+    let _ = adb(&["shell", &cleanup]);
+
+    let dir = report_dir(state)?.join("video");
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let shared: Shared = Arc::default();
+    let thread = std::thread::Builder::new()
+        .name("video".into())
+        .spawn({
+            let shared = shared.clone();
+            let dir = dir.clone();
+            move || record_parts(&shared, &dir)
+        })
+        .map_err(|e| format!("cannot start the video thread: {e}"))?;
+    Ok(Video {
+        shared,
+        thread: Some(thread),
+        dir,
+        parts_linked: false,
+    })
+}
+
+/// The recording thread: records parts one after another until told to stop.
+fn record_parts(shared: &Shared, dir: &Path) {
+    let session = std::process::id();
+    let mut failures = 0;
+    for n in 1.. {
+        let cuts_before = {
+            let r = lock(shared);
+            if r.stop {
+                break;
+            }
+            r.cuts
+        };
+        let device_file = format!("{DEVICE_TMP}/phantomqa-{session}-{n}.mp4");
+        let file = dir.join(format!("part-{n:03}.mp4"));
+        let started = Instant::now();
+        let result = record_part(shared, &device_file).and_then(|()| pull_video(&device_file, &file));
+        let _ = adb(&["shell", "rm", "-f", &device_file]);
+
+        let mut r = lock(shared);
+        r.finished += 1;
+        match result {
+            Ok(()) => {
+                failures = 0;
+                r.parts.push(Part {
+                    file,
+                    seconds: started.elapsed().as_secs_f64(),
+                });
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&file);
+                // A part stopped right after it started can be empty. That is not a failure.
+                let stopped_by_us = r.cuts != cuts_before || r.stop;
+                if !stopped_by_us {
+                    failures += 1;
+                }
+                if failures >= MAX_PART_FAILURES {
+                    r.error = Some(e);
+                    break;
+                }
+            }
+        }
+        shared.1.notify_all();
+        drop(r);
+        if failures > 0 {
+            sleep(Duration::from_secs(1));
+        }
+    }
+    lock(shared).done = true;
+    shared.1.notify_all();
+}
+
+/// Records one part on the device. Returns when screenrecord stops (time limit or signal).
+fn record_part(shared: &Shared, device_file: &str) -> Result<(), String> {
+    // `exec` keeps the shell's PID, which `echo $$` prints first, so we can stop exactly this recorder.
+    let script = format!(
+        "echo $$; exec screenrecord --time-limit {PART_SECONDS} --bit-rate {VIDEO_BIT_RATE} {}",
+        shell_quote(device_file)
+    );
+    let mut child = adb_command()
+        .args(["shell", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(adb_missing)?;
+
+    // Keep reading both pipes until the end. Closing them early can end the recording.
+    let (pid_tx, pid_rx) = mpsc::channel();
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let out_reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut first = String::new();
+        let _ = reader.read_line(&mut first);
+        let _ = pid_tx.send(first);
+        let mut rest = String::new();
+        let _ = reader.read_to_string(&mut rest);
+    });
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let err_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+
+    let pid = pid_rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if is_pid(&pid) {
+        let stop_now = {
+            let mut r = lock(shared);
+            r.pid = Some(pid.clone());
+            r.stop
+        };
+        // Stop was asked while this part was starting.
+        if stop_now {
+            stop_part(&pid);
+        }
+    }
+    let status = wait_with_timeout(&mut child, Duration::from_secs(PART_SECONDS + 30));
+    lock(shared).pid = None;
+    let _ = out_reader.join();
+    let errors = err_reader.join().unwrap_or_default();
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(format!("screenrecord failed: {}", errors.trim())),
+        Err(e) => Err(format!("screenrecord {e}")),
+    }
+}
+
+fn is_pid(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Asks one screenrecord to stop. SIGINT makes it finish the file properly.
+fn stop_part(pid: &str) {
+    if is_pid(pid) {
+        // Check the PID still belongs to screenrecord before signalling it.
+        let _ = adb(&[
+            "shell",
+            &format!("grep -q screenrecord /proc/{pid}/cmdline 2>/dev/null && kill -2 {pid}"),
+        ]);
+    }
+}
+
+/// A finished MP4 has an "ftyp" box at the start and a "moov" box. A killed recording has no "moov".
+fn looks_like_mp4(bytes: &[u8]) -> bool {
+    bytes.len() > 1024 && &bytes[4..8] == b"ftyp" && bytes.windows(4).any(|w| w == b"moov")
+}
+
+/// Copies a recording from the device. `exec-out cat` avoids host path quoting problems.
+fn pull_video(device_file: &str, file: &Path) -> Result<(), String> {
+    let bytes = adb_bytes(&["exec-out", "cat", device_file])?;
+    if !looks_like_mp4(&bytes) {
+        return Err("the recording is empty or broken".into());
+    }
+    if let Some(dir) = file.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    fs::write(file, bytes).map_err(|e| format!("cannot write {}: {e}", file.display()))
+}
+
+/// The last part, plus the part before it when the last one is short.
+fn clip_parts(parts: &[Part]) -> Vec<PathBuf> {
+    match parts {
+        [] => Vec::new(),
+        [.., before, last] if last.seconds < MIN_CLIP_SECONDS => vec![before.file.clone(), last.file.clone()],
+        [.., last] => vec![last.file.clone()],
+    }
+}
+
+impl Video {
+    /// Ends the current part, so the video covers the moment of the bug. Returns the parts for its clip.
+    fn cut(&self) -> Result<Vec<PathBuf>, String> {
+        let deadline = Instant::now() + CUT_TIMEOUT;
+        let mut r = lock(&self.shared);
+        if r.done {
+            return Err(r.error.clone().unwrap_or_else(|| "video has stopped".into()));
+        }
+        let before = r.finished;
+        r.cuts += 1;
+        let mut stopped: Option<String> = None;
+        while r.finished == before && !r.done {
+            // Stop whichever part is recording now; a new one may have started meanwhile.
+            if let Some(pid) = r.pid.clone()
+                && stopped.as_ref() != Some(&pid)
+            {
+                drop(r);
+                stop_part(&pid);
+                stopped = Some(pid);
+                r = lock(&self.shared);
+                continue;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err("the video part was not ready in time".into());
+            }
+            r = self.shared.1.wait_timeout(r, left).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        let parts = clip_parts(&r.parts);
+        if parts.is_empty() {
+            return Err(r.error.clone().unwrap_or_else(|| "no video was recorded yet".into()));
+        }
+        Ok(parts)
+    }
+
+    /// Stops recording and waits for the last part.
+    fn stop(&mut self) {
+        let pid = {
+            let mut r = lock(&self.shared);
+            r.stop = true;
+            r.pid.clone()
+        };
+        if let Some(pid) = pid {
+            stop_part(&pid);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Joins video files into one with ffmpeg, without re-encoding.
+fn join_videos(ffmpeg: &str, files: &[PathBuf], out: &Path) -> Result<(), String> {
+    let list = out.with_extension("txt");
+    let lines: String = files
+        .iter()
+        .map(|f| format!("file '{}'\n", f.to_string_lossy().replace('\'', "'\\''")))
+        .collect();
+    fs::write(&list, lines).map_err(|e| format!("cannot write {}: {e}", list.display()))?;
+    let result = Command::new(ffmpeg)
+        .args(["-nostdin", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&list)
+        .args(["-map", "0:v", "-c", "copy"])
+        .arg(out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run ffmpeg ({ffmpeg}): {e}"))
+        .and_then(|mut child| {
+            let mut stderr = child.stderr.take().expect("stderr is piped");
+            let reader = std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = stderr.read_to_string(&mut text);
+                text
+            });
+            let status = wait_with_timeout(&mut child, FFMPEG_TIMEOUT).map_err(|e| format!("ffmpeg {e}"))?;
+            let errors = reader.join().unwrap_or_default();
+            let size = fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+            if status.success() && size > 0 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "ffmpeg failed: {}",
+                    errors.lines().next().unwrap_or("no output")
+                ))
+            }
+        });
+    let _ = fs::remove_file(&list);
+    if result.is_err() {
+        let _ = fs::remove_file(out);
+    }
+    result
+}
+
+/// Makes one video from the given parts: a copy for one part, ffmpeg for more.
+fn make_video(files: &[PathBuf], out: &Path) -> Result<(), String> {
+    match (files, &config().ffmpeg) {
+        ([], _) => Err("no video parts".into()),
+        ([one], _) => fs::copy(one, out)
+            .map(|_| ())
+            .map_err(|e| format!("cannot write {}: {e}", out.display())),
+        (_, Some(ffmpeg)) => join_videos(ffmpeg, files, out),
+        (_, None) => Err("ffmpeg is not installed".into()),
+    }
+}
+
+/// Markdown links to raw parts, relative to the run folder.
+fn part_links(files: &[PathBuf]) -> String {
+    let links: Vec<String> = files
+        .iter()
+        .filter_map(|f| f.file_name()?.to_str().map(|name| format!("[{name}](video/{name})")))
+        .collect();
+    links.join(", ")
+}
+
+/// The video line for a bug: its own clip, or links to the raw parts.
+fn video_clip(video: &mut Video, run_dir: &Path, name: &str) -> String {
+    let parts = match video.cut() {
+        Ok(parts) => parts,
+        Err(e) => return format!("(no video: {e})"),
+    };
+    let clip = run_dir.join(format!("{name}.mp4"));
+    match make_video(&parts, &clip) {
+        Ok(()) => format!("Video: [{name}.mp4]({name}.mp4)"),
+        Err(e) => {
+            video.parts_linked = true;
+            format!("Video parts ({e}): {}", part_links(&parts))
+        }
+    }
+}
+
+/// Ends the session: stops recording, makes session.mp4 and adds a video note to the report.
+fn finish_session(state: &mut State) {
+    let note = match state.video.take() {
+        Some(mut video) => {
+            video.stop();
+            let r = lock(&video.shared);
+            let files: Vec<PathBuf> = r.parts.iter().map(|p| p.file.clone()).collect();
+            let run_dir = video.dir.parent().map(Path::to_path_buf).unwrap_or_default();
+            let mut note = match make_video(&files, &run_dir.join("session.mp4")) {
+                Ok(()) => {
+                    if !video.parts_linked {
+                        let _ = fs::remove_dir_all(&video.dir);
+                    }
+                    "Whole session: [session.mp4](session.mp4)".to_string()
+                }
+                Err(_) if files.is_empty() => "No video was recorded.".to_string(),
+                Err(e) => format!("The session video is in parts in the video folder ({e})."),
+            };
+            if let Some(error) = &r.error {
+                note.push_str(&format!("\n\nRecording stopped early: {error}"));
+            }
+            note
+        }
+        None => match &state.video_off {
+            Some(reason) => format!("Video was off: {reason}."),
+            None => return,
+        },
+    };
+    // Only write into a report that exists; video off and no bugs means no folder.
+    if let Some(report) = &state.report {
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(report.dir.join("report.md"))
+            .and_then(|mut file| file.write_all(format!("\n## Video\n\n{note}\n").as_bytes()));
+    }
 }
 
 // ---------------------------------------------------------------- MCP server
@@ -1133,7 +1716,7 @@ fn tool_list() -> Value {
         },
         {
             "name": "report_bug",
-            "description": "Save a bug to the test report. A screenshot of the current screen and the app log are attached automatically, so call this while the bug is on screen. Crashes are saved automatically; do not report them again.",
+            "description": "Save a bug to the test report. The app log, a screenshot and a video clip are attached automatically (when turned on), so call this while the bug is on screen. Crashes are saved automatically; do not report them again.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1152,17 +1735,16 @@ fn tool_list() -> Value {
 fn call_tool(state: &mut State, params: &Value) -> Value {
     let name = params["name"].as_str().unwrap_or("");
     let args = &params["arguments"];
-    let int = |key: &str| {
-        args[key]
-            .as_i64()
-            .ok_or_else(|| format!("argument {key:?} must be an integer"))
-    };
+    let int = |key: &str| int_arg(&args[key]).ok_or_else(|| format!("argument {key:?} must be an element number"));
     let text = |key: &str| {
         args[key]
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| format!("argument {key:?} must be a string"))
     };
+    if !state.video_checked {
+        start_video(state);
+    }
     // Start the crash clock before the first action, so a crash it causes is not missed.
     if state.crash_since.is_none() {
         state.crash_since = device_now().ok();
@@ -1193,6 +1775,27 @@ fn call_tool(state: &mut State, params: &Value) -> Value {
     }
     text.push_str(&notice);
     json!({"content": [{"type": "text", "text": text.trim_start()}], "isError": is_error})
+}
+
+/// An element number sent as 3, 3.0, "3" or "[3]".
+fn int_arg(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|f| f.fract() == 0.0 && f.abs() < 1e9)
+                .map(|f| f as i64)
+        })
+        .or_else(|| {
+            value
+                .as_str()?
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse()
+                .ok()
+        })
 }
 
 /// Handles one JSON-RPC message. Returns the reply, or None for notifications.
@@ -1226,6 +1829,12 @@ fn serve_mcp(mut state: State) {
             continue;
         }
         let reply = match serde_json::from_str::<Value>(&line) {
+            // Batches were removed from MCP in 2025-06-18; answer instead of staying silent.
+            Ok(Value::Array(_)) => Some(json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {"code": -32600, "message": "batches are not supported; send one message per line"},
+            })),
             Ok(msg) => handle_message(&mut state, &msg),
             Err(e) => Some(json!({
                 "jsonrpc": "2.0",
@@ -1239,9 +1848,9 @@ fn serve_mcp(mut state: State) {
             break;
         }
     }
+    // The client closed stdin: the test session is over.
+    finish_session(&mut state);
 }
-
-// ---------------------------------------------------------------- CLI
 
 // ---------------------------------------------------------------- doctor
 
@@ -1320,7 +1929,12 @@ fn doctor() -> bool {
         "set --reports or PHANTOMQA_REPORTS to a folder you can write to",
     );
 
-    println!("info  video: {}", if config.video { "on" } else { "off" });
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    println!(
+        "info  video: {}, screenshots: {}",
+        on_off(config.video),
+        on_off(config.screenshots)
+    );
     ok
 }
 
@@ -1343,7 +1957,8 @@ options (each also has an env var):
   --serial ID         device to use         ANDROID_SERIAL  (default: the only device connected)
   --reports DIR       reports folder        PHANTOMQA_REPORTS  (default: reports)
   --ffmpeg PATH       ffmpeg, optional      FFMPEG  (default: PATH)
-  --no-video          do not record video   PHANTOMQA_VIDEO=0";
+  --no-video          do not record video   PHANTOMQA_VIDEO=0
+  --no-screenshots    no screenshots        PHANTOMQA_SCREENSHOTS=0";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1422,7 +2037,9 @@ mod tests {
 </hierarchy>"#;
 
     fn test_state() -> State {
-        State::new(std::env::temp_dir().join("phantomqa-test-unused"))
+        let mut state = State::new(std::env::temp_dir().join("phantomqa-test-unused"));
+        state.video_checked = true; // never record from unit tests
+        state
     }
 
     #[test]
@@ -1448,6 +2065,8 @@ mod tests {
         let xml = extract_hierarchy(&out).unwrap();
         assert!(xml.starts_with("<hierarchy") && xml.ends_with("</hierarchy>"));
         assert_eq!(extract_hierarchy("ERROR: could not get idle state."), None);
+        let empty = extract_hierarchy("<?xml version='1.0' ?><hierarchy rotation=\"0\" />").unwrap();
+        assert_eq!(parse_screen(&empty).1.len(), 0);
     }
 
     #[test]
@@ -1470,10 +2089,14 @@ mod tests {
     #[test]
     fn quotes_for_device_shell() {
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
-        assert_eq!(input_text_arg("hi there; rm -rf").unwrap(), "'hi%sthere;%srm%s-rf'");
-        assert!(input_text_arg("").is_err());
-        assert!(input_text_arg("héllo").is_err());
-        assert!(input_text_arg("a\nb").is_err());
+        assert_eq!(input_text_args("hi there; rm -rf").unwrap(), ["'hi%sthere;%srm%s-rf'"]);
+        // A literal "%s" would become a space, so it is typed in two calls.
+        assert_eq!(input_text_args("50%sale").unwrap(), ["'50%'", "'sale'"]);
+        assert_eq!(input_text_args("% s").unwrap(), ["'%%ss'"]);
+        assert_eq!(input_text_args("-5").unwrap(), ["'-5'"]);
+        assert!(input_text_args("").is_err());
+        assert!(input_text_args("héllo").is_err());
+        assert!(input_text_args("a\nb").is_err());
     }
 
     #[test]
@@ -1690,7 +2313,7 @@ mod tests {
         .unwrap();
         assert_eq!(start, 6);
         assert_eq!(config.adb, "/x/adb");
-        assert_eq!(config.reports, PathBuf::from("out"));
+        assert!(config.reports.is_absolute() && config.reports.ends_with("out"));
         assert_eq!(config.serial.as_deref(), Some("emu-1"));
         assert!(!config.video);
 
@@ -1698,7 +2321,15 @@ mod tests {
         let (_, start) = load_config(&args(&["type", "2", "--adb"]), &no_env).unwrap();
         assert_eq!(start, 0);
 
+        let (config, _) = load_config(&args(&["--no-screenshots", "mcp"]), &no_env).unwrap();
+        assert!(!config.screenshots && config.video);
+        assert!(load_config(&args(&["--no-video=1"]), &no_env).is_err());
+
         assert!(load_config(&args(&["--adb"]), &no_env).is_err());
+        assert!(load_config(&args(&["--adb="]), &no_env).is_err());
+        assert!(load_config(&args(&["--reports", "--no-video"]), &no_env).is_err());
+        let (_, start) = load_config(&args(&["--no-video", "--", "screen"]), &no_env).unwrap();
+        assert_eq!(start, 2);
         assert!(load_config(&args(&["--nope", "screen"]), &no_env).is_err());
     }
 
@@ -1709,13 +2340,14 @@ mod tests {
             "FFMPEG" => Some("/env/ffmpeg".to_string()),
             "PHANTOMQA_REPORTS" => Some("env-reports".to_string()),
             "PHANTOMQA_VIDEO" => Some("0".to_string()),
+            "PHANTOMQA_SCREENSHOTS" => Some("0".to_string()),
             _ => None,
         };
         let (config, _) = load_config(&[], &env).unwrap();
         assert_eq!(config.adb, "/env/adb");
         assert_eq!(config.ffmpeg.as_deref(), Some("/env/ffmpeg"));
-        assert_eq!(config.reports, PathBuf::from("env-reports"));
-        assert!(!config.video);
+        assert!(config.reports.ends_with("env-reports"));
+        assert!(!config.video && !config.screenshots);
 
         let (config, _) = load_config(&args(&["--adb", "/flag/adb", "--ffmpeg", "/flag/ffmpeg"]), &env).unwrap();
         assert_eq!(config.adb, "/flag/adb");
@@ -1732,5 +2364,129 @@ mod tests {
         );
         assert_eq!(find_adb(&|_: &str| None), "adb");
         fs::remove_dir_all(sdk).unwrap();
+    }
+
+    #[test]
+    fn checks_mp4_files() {
+        let mut good = vec![0, 0, 0, 24];
+        good.extend_from_slice(b"ftypmp42");
+        good.resize(2000, 0);
+        good.extend_from_slice(b"moov");
+        assert!(looks_like_mp4(&good));
+
+        let mut killed = good.clone();
+        killed.truncate(2000); // no "moov": the recording was cut off
+        assert!(!looks_like_mp4(&killed));
+        assert!(!looks_like_mp4(b"short"));
+        assert!(!looks_like_mp4(&[0u8; 4096]));
+    }
+
+    #[test]
+    fn picks_parts_for_a_bug_clip() {
+        let part = |name: &str, seconds| Part {
+            file: PathBuf::from(name),
+            seconds,
+        };
+        assert!(clip_parts(&[]).is_empty());
+        assert_eq!(clip_parts(&[part("a", 3.0)]), vec![PathBuf::from("a")]);
+        assert_eq!(
+            clip_parts(&[part("a", 30.0), part("b", 3.0)]),
+            vec![PathBuf::from("a"), PathBuf::from("b")],
+            "a short last part gets the one before it"
+        );
+        assert_eq!(
+            clip_parts(&[part("a", 30.0), part("b", 25.0)]),
+            vec![PathBuf::from("b")]
+        );
+        assert_eq!(
+            part_links(&[PathBuf::from("/x/video/part-001.mp4")]),
+            "[part-001.mp4](video/part-001.mp4)"
+        );
+        assert!(is_pid("4321") && !is_pid("") && !is_pid("12; rm"));
+    }
+
+    #[test]
+    fn makes_videos_without_ffmpeg_when_possible() {
+        let dir = std::env::temp_dir().join(format!("phantomqa-video-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let one = dir.join("part-001.mp4");
+        fs::write(&one, b"video").unwrap();
+        let out = dir.join("bug-01.mp4");
+        make_video(std::slice::from_ref(&one), &out).unwrap();
+        assert_eq!(fs::read(&out).unwrap(), b"video", "one part is copied as is");
+        assert!(make_video(&[], &out).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn video_off_note_needs_a_report() {
+        let root = std::env::temp_dir().join(format!("phantomqa-note-{}", std::process::id()));
+        let mut state = State::new(root.clone());
+        state.video_off = Some("turned off".into());
+        finish_session(&mut state);
+        assert!(!root.exists(), "no bugs and no video: no folder");
+
+        let dir = report_dir(&mut state).unwrap();
+        finish_session(&mut state);
+        let report = fs::read_to_string(dir.join("report.md")).unwrap();
+        assert!(report.ends_with("\n## Video\n\nVideo was off: turned off.\n"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reads_element_numbers_leniently() {
+        assert_eq!(int_arg(&json!(3)), Some(3));
+        assert_eq!(int_arg(&json!(3.0)), Some(3));
+        assert_eq!(int_arg(&json!("3")), Some(3));
+        assert_eq!(int_arg(&json!("[3]")), Some(3));
+        assert_eq!(int_arg(&json!(3.5)), None);
+        assert_eq!(int_arg(&json!("three")), None);
+        assert_eq!(int_arg(&Value::Null), None);
+    }
+
+    #[test]
+    fn crash_titles_and_code_blocks_are_safe() {
+        let crash = Crash {
+            kind: "crash",
+            process: String::new(),
+            summary: String::new(),
+            lines: vec![],
+        };
+        assert_eq!(crash.title(), "Crash in unknown process: app stopped");
+        assert_eq!(code_block("a"), "```\na\n```\n");
+        assert_eq!(code_block("x ``` y"), "````\nx ``` y\n````\n");
+        let args = json!({"title": "Two\nlines", "steps": ["s"], "expected": "e", "actual": "a"});
+        assert_eq!(bug_from_args(&args, "").unwrap().title, "Two lines");
+    }
+
+    #[test]
+    fn saves_each_crash_of_the_tested_app_once() {
+        let root = std::env::temp_dir().join(format!("phantomqa-crashes-{}", std::process::id()));
+        let mut state = State::new(root.clone());
+        state.video_checked = true;
+        state.apps = vec!["com.android.settings".into()];
+        let crashes = parse_crashes(CRASH_LOG);
+
+        let first = handle_crashes(&mut state, &crashes);
+        assert!(first.contains("Saved to the report as bug 1"));
+        assert!(first.contains("(another app crashed, not saved: ANR in com.example.app"));
+        assert!(first.contains("(another app crashed, not saved: Native crash in com.example.game"));
+
+        let again = handle_crashes(&mut state, &crashes[..1]);
+        assert!(again.contains("The same crash happened again (bug 1)"));
+        assert_eq!(state.report.as_ref().unwrap().bugs, 1);
+
+        // A deleted report folder is created again.
+        fs::remove_dir_all(&root).unwrap();
+        let bug = Bug {
+            title: "t".into(),
+            severity: "low".into(),
+            package: String::new(),
+            body: "b".into(),
+        };
+        assert_eq!(save_bug(&mut state, &bug, "").unwrap(), 2);
+        let report = fs::read_to_string(root.join("run-001").join("report.md")).unwrap();
+        assert!(report.contains("## Bug 2: t"));
+        fs::remove_dir_all(root).unwrap();
     }
 }
