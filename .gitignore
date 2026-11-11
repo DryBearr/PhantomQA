@@ -1,0 +1,9 @@
+# Build output
+/target/
+
+# Local files
+.env
+*.log
+.DS_Store
+.idea/
+.vscode/

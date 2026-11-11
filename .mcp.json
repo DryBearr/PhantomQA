@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "phantomqa": {
+      "command": "./target/release/phantomqa",
+      "args": ["mcp"],
+      "env": { "ANDROID_HOME": "${HOME}/.local/share/android/sdk" }
+    }
+  }
+}
