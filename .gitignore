@@ -7,6 +7,9 @@
 # Your local MCP config (copy .mcp.json.example)
 /.mcp.json
 
+# API token hashes, and their lock and temp files
+/tokens.json*
+
 # Local files
 .env
 *.log

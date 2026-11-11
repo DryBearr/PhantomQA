@@ -109,6 +109,8 @@ struct Config {
     screenshots: bool,
     /// None means adb picks the device (it reads ANDROID_SERIAL itself).
     serial: Option<String>,
+    /// tokens.json: the hashed API tokens.
+    tokens: PathBuf,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -123,7 +125,7 @@ fn env_var(name: &str) -> Option<String> {
 
 /// Reads the options before the command. Returns the config and where the command starts.
 fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<(Config, usize), String> {
-    let (mut adb, mut ffmpeg, mut reports, mut serial) = (None, None, None, None);
+    let (mut adb, mut ffmpeg, mut reports, mut serial, mut tokens) = (None, None, None, None, None);
     let (mut no_video, mut no_screenshots) = (false, false);
     let mut i = 0;
     while let Some(arg) = args.get(i).filter(|a| a.starts_with("--")) {
@@ -153,6 +155,7 @@ fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<
             "--ffmpeg" => &mut ffmpeg,
             "--reports" => &mut reports,
             "--serial" => &mut serial,
+            "--tokens" => &mut tokens,
             _ => return Err(format!("unknown option: {name}")),
         };
         let value = match inline {
@@ -189,6 +192,14 @@ fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<
         video: !no_video && env("PHANTOMQA_VIDEO").is_none_or(|v| v != "0"),
         screenshots: !no_screenshots && env("PHANTOMQA_SCREENSHOTS").is_none_or(|v| v != "0"),
         serial,
+        tokens: {
+            let tokens = PathBuf::from(
+                tokens
+                    .or_else(|| env("PHANTOMQA_TOKENS"))
+                    .unwrap_or_else(|| "tokens.json".into()),
+            );
+            std::path::absolute(&tokens).unwrap_or(tokens)
+        },
     };
     Ok((config, i))
 }
@@ -1852,6 +1863,463 @@ fn serve_mcp(mut state: State) {
     finish_session(&mut state);
 }
 
+// ---------------------------------------------------------------- tokens
+//
+// API tokens look like `pqa_<id>_<secret>`: a short public id to find the token, and 32 random
+// bytes of secret. tokens.json keeps only a SHA-256 hash of each token. SHA-256 is enough for
+// random tokens; slow hashes are for passwords people choose. The file is read on every check,
+// so a removed or rotated token stops working at once, and a broken file refuses every token.
+
+const TOKEN_PREFIX: &str = "pqa_";
+const TOKEN_ID_BYTES: usize = 8;
+const TOKEN_SECRET_BYTES: usize = 32;
+const TOKENS_FILE_VERSION: u64 = 1;
+/// Longer Authorization headers are refused without further work.
+const MAX_AUTH_HEADER: usize = 512;
+/// A lock older than this was left by a killed command.
+const STALE_LOCK: Duration = Duration::from_secs(30);
+
+/// One stored token. A name can have two entries for a while during a rotation with grace time.
+#[derive(Debug, Clone, PartialEq)]
+struct TokenEntry {
+    name: String,
+    id: String,
+    /// "sha256:<hex>" of the whole token.
+    hash: String,
+    /// Unix seconds; None means it never expires.
+    expires: Option<u64>,
+    /// Lifetime given when created, reused by `rotate`.
+    ttl: Option<u64>,
+    /// An old key kept valid until `expires` after a rotation.
+    rotated: bool,
+}
+
+/// Why a token was refused. Clients get the same 401 for all of them; the reason is for logs.
+#[derive(Debug, PartialEq)]
+enum TokenDenied {
+    Missing,
+    Malformed,
+    Unknown,
+    Expired,
+    /// tokens.json is missing or broken, so nothing is accepted.
+    NoTokens(String),
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Random bytes from the OS, as hex. Fails instead of falling back to weak randomness.
+fn random_hex(bytes: usize) -> Result<String, String> {
+    let mut buf = vec![0u8; bytes];
+    getrandom::fill(&mut buf).map_err(|e| format!("the OS random generator failed: {e}"))?;
+    Ok(hex(&buf))
+}
+
+fn hash_token(token: &str) -> String {
+    use sha2::Digest;
+    format!("sha256:{}", hex(&sha2::Sha256::digest(token.as_bytes())))
+}
+
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Splits `pqa_<id>_<secret>` into id and secret, or None if the format is wrong in any way.
+fn parse_token(token: &str) -> Option<(&str, &str)> {
+    let (id, secret) = token.strip_prefix(TOKEN_PREFIX)?.split_once('_')?;
+    (is_lower_hex(id, TOKEN_ID_BYTES * 2) && is_lower_hex(secret, TOKEN_SECRET_BYTES * 2)).then_some((id, secret))
+}
+
+/// The token from an `Authorization: Bearer <token>` header value.
+fn bearer_token(header: &str) -> Option<&str> {
+    if header.len() > MAX_AUTH_HEADER {
+        return None;
+    }
+    let (scheme, token) = header.trim().split_once(char::is_whitespace)?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty() && !token.contains(char::is_whitespace))
+        .then_some(token)
+}
+
+/// Checks a presented token against the entries. Returns the token's name.
+fn check_token(entries: &[TokenEntry], token: &str, now: u64) -> Result<String, TokenDenied> {
+    let Some((id, _)) = parse_token(token) else {
+        return Err(TokenDenied::Malformed);
+    };
+    use subtle::ConstantTimeEq;
+    let hash = hash_token(token);
+    let entry = entries
+        .iter()
+        .find(|e| e.id == id && bool::from(e.hash.as_bytes().ct_eq(hash.as_bytes())))
+        .ok_or(TokenDenied::Unknown)?;
+    if entry.expires.is_some_and(|t| now >= t) {
+        return Err(TokenDenied::Expired);
+    }
+    Ok(entry.name.clone())
+}
+
+/// Checks an Authorization header against the tokens file, read fresh. This is what the API calls.
+fn authorize(tokens_file: &Path, header: Option<&str>) -> Result<String, TokenDenied> {
+    let token = header.and_then(bearer_token).ok_or(TokenDenied::Missing)?;
+    let entries = match load_tokens(tokens_file) {
+        Ok(entries) if entries.is_empty() => return Err(TokenDenied::NoTokens("no tokens exist".into())),
+        Ok(entries) => entries,
+        Err(e) => return Err(TokenDenied::NoTokens(e)),
+    };
+    check_token(&entries, token, now_secs())
+}
+
+fn valid_token_name(name: &str) -> bool {
+    (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// "30d", "12h", "90m" -> seconds; "never" -> None.
+fn parse_duration(s: &str) -> Result<Option<u64>, String> {
+    if s == "never" {
+        return Ok(None);
+    }
+    let error = || format!("not a duration: {s:?} (use for example 90m, 12h, 30d or never)");
+    let unit = match s.chars().last() {
+        Some('m') => 60,
+        Some('h') => 3600,
+        Some('d') => 86400,
+        _ => return Err(error()),
+    };
+    let n: u64 = s[..s.len() - 1].parse().map_err(|_| error())?;
+    if n == 0 {
+        return Err(error());
+    }
+    n.checked_mul(unit).map(Some).ok_or_else(error)
+}
+
+/// Unix seconds as "2026-12-31 14:05 UTC".
+fn utc_date(secs: u64) -> String {
+    // Days to civil date, from Howard Hinnant's algorithm.
+    let days = (secs / 86400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let rest = secs % 86400;
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        rest / 3600,
+        rest % 3600 / 60
+    )
+}
+
+fn token_entry_from_json(v: &Value) -> Option<TokenEntry> {
+    let text = |key: &str| v[key].as_str().map(str::to_string);
+    Some(TokenEntry {
+        name: text("name").filter(|n| valid_token_name(n))?,
+        id: text("id")?,
+        hash: text("hash")?,
+        expires: v["expires"].as_u64(),
+        ttl: v["ttl"].as_u64(),
+        rotated: v["rotated"].as_bool().unwrap_or(false),
+    })
+}
+
+/// Reads tokens.json. A missing file means no tokens; anything unexpected is an error.
+fn load_tokens(path: &Path) -> Result<Vec<TokenEntry>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let broken = |why: &str| format!("{} is broken ({why}); fix or delete it", path.display());
+    let doc: Value = serde_json::from_str(&text).map_err(|e| broken(&e.to_string()))?;
+    if doc["version"].as_u64() != Some(TOKENS_FILE_VERSION) {
+        return Err(broken("unknown version"));
+    }
+    let list = doc["tokens"].as_array().ok_or_else(|| broken("no token list"))?;
+    list.iter()
+        .map(|v| token_entry_from_json(v).ok_or_else(|| broken("an entry is missing a field")))
+        .collect()
+}
+
+/// Writes tokens.json atomically (temp file, then rename), readable only by the owner.
+fn save_tokens(path: &Path, entries: &[TokenEntry]) -> Result<(), String> {
+    let tokens: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            json!({
+                "name": e.name, "id": e.id, "hash": e.hash,
+                "expires": e.expires, "ttl": e.ttl, "rotated": e.rotated,
+            })
+        })
+        .collect();
+    let text = serde_json::to_string_pretty(&json!({"version": TOKENS_FILE_VERSION, "tokens": tokens}))
+        .map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let written = options.open(&tmp).and_then(|mut file| {
+        file.write_all(text.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    });
+    let result = written.and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Holds tokens.json.lock while it lives, so two commands cannot overwrite each other's changes.
+struct TokensLock(PathBuf);
+
+impl TokensLock {
+    fn take(tokens_file: &Path) -> Result<Self, String> {
+        let lock = tokens_file.with_extension("json.lock");
+        if let Some(dir) = lock.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(_) => return Ok(TokensLock(lock)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > STALE_LOCK));
+                    if stale {
+                        let _ = fs::remove_file(&lock);
+                        continue;
+                    }
+                    if Instant::now() > deadline {
+                        return Err(format!(
+                            "{} is locked by another phantomqa command",
+                            tokens_file.display()
+                        ));
+                    }
+                    sleep(Duration::from_millis(50));
+                }
+                Err(e) => return Err(format!("cannot lock {}: {e}", tokens_file.display())),
+            }
+        }
+    }
+}
+
+impl Drop for TokensLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Runs a change on the token list under the lock. Expired entries are dropped on every change.
+fn change_tokens<T>(
+    path: &Path,
+    now: u64,
+    f: impl FnOnce(&mut Vec<TokenEntry>) -> Result<T, String>,
+) -> Result<T, String> {
+    let _lock = TokensLock::take(path)?;
+    let mut entries = load_tokens(path)?;
+    entries.retain(|e| e.expires.is_none_or(|t| now < t));
+    let result = f(&mut entries)?;
+    save_tokens(path, &entries)?;
+    Ok(result)
+}
+
+/// A new token entry. Returns the entry and the token, which is never stored.
+fn new_token(name: &str, ttl: Option<u64>, now: u64, taken: &[TokenEntry]) -> Result<(TokenEntry, String), String> {
+    // A repeated id is astronomically unlikely, but cheap to rule out.
+    let id = loop {
+        let id = random_hex(TOKEN_ID_BYTES)?;
+        if !taken.iter().any(|e| e.id == id) {
+            break id;
+        }
+    };
+    let token = format!("{TOKEN_PREFIX}{id}_{}", random_hex(TOKEN_SECRET_BYTES)?);
+    let entry = TokenEntry {
+        name: name.to_string(),
+        id,
+        hash: hash_token(&token),
+        expires: ttl.map(|t| now.saturating_add(t)),
+        ttl,
+        rotated: false,
+    };
+    Ok((entry, token))
+}
+
+fn token_add(path: &Path, name: &str, ttl: Option<u64>, now: u64) -> Result<String, String> {
+    if !valid_token_name(name) {
+        return Err(format!("not a valid token name: {name:?} (1-64 of a-z A-Z 0-9 . _ -)"));
+    }
+    change_tokens(path, now, |entries| {
+        if entries.iter().any(|e| e.name == name) {
+            return Err(format!(
+                "a token named {name:?} exists; use `token rotate {name}` for a new one"
+            ));
+        }
+        let (entry, token) = new_token(name, ttl, now, entries)?;
+        entries.push(entry);
+        Ok(token)
+    })
+}
+
+/// Makes a new token for a name. The old one stops at once, or after `grace` seconds.
+fn token_rotate(path: &Path, name: &str, grace: u64, ttl: Option<Option<u64>>, now: u64) -> Result<String, String> {
+    change_tokens(path, now, |entries| {
+        let current = entries
+            .iter()
+            .find(|e| e.name == name && !e.rotated)
+            .or_else(|| entries.iter().find(|e| e.name == name))
+            .cloned()
+            .ok_or_else(|| format!("no token named {name:?}"))?;
+        // Keep the old lifetime unless a new one is given.
+        let (entry, token) = new_token(name, ttl.unwrap_or(current.ttl), now, entries)?;
+        if grace == 0 {
+            entries.retain(|e| e.name != name);
+        } else {
+            let until = now.saturating_add(grace);
+            for e in entries.iter_mut().filter(|e| e.name == name) {
+                e.rotated = true;
+                e.expires = Some(e.expires.map_or(until, |t| t.min(until)));
+            }
+        }
+        entries.push(entry);
+        Ok(token)
+    })
+}
+
+/// Revokes a name's tokens: all of them, or with `old_only` just the keys kept by a rotation.
+fn token_remove(path: &Path, name: &str, old_only: bool, now: u64) -> Result<usize, String> {
+    change_tokens(path, now, |entries| {
+        let before = entries.len();
+        entries.retain(|e| !(e.name == name && (e.rotated || !old_only)));
+        match before - entries.len() {
+            0 if old_only => Err(format!("{name:?} has no old token from a rotation")),
+            0 => Err(format!("no token named {name:?}")),
+            removed => Ok(removed),
+        }
+    })
+}
+
+fn render_token_list(entries: &[TokenEntry], now: u64) -> String {
+    if entries.is_empty() {
+        return "No tokens. Add one with: phantomqa token add NAME\n".into();
+    }
+    let mut out = format!("{:<24} {:<18} {}\n", "NAME", "ID", "STATUS");
+    for e in entries {
+        let status = match e.expires {
+            Some(t) if now >= t => "expired".to_string(),
+            Some(t) if e.rotated => format!("old key, works until {}", utc_date(t)),
+            Some(t) => format!("expires {}", utc_date(t)),
+            None => "never expires".to_string(),
+        };
+        out.push_str(&format!("{:<24} {:<18} {status}\n", e.name, e.id));
+    }
+    out
+}
+
+const TOKEN_USAGE: &str = "usage:
+  phantomqa token add NAME [--expires 30d]            print a new token (shown only once)
+  phantomqa token rotate NAME [--grace 1h] [--expires 30d]
+                                                      new token; the old one stops now, or after the grace time
+  phantomqa token remove NAME [--old]                 revoke the token (--old: only the key kept by a rotation)
+  phantomqa token list                                names, ids and expiry; never the tokens
+  phantomqa token check                               read a token from stdin and say if it works
+
+durations: 90m, 12h, 30d, or never (the default for --expires)";
+
+/// The value of `--name VALUE` in a subcommand's arguments.
+fn sub_option<'a>(args: &[&'a str], name: &str) -> Result<Option<&'a str>, String> {
+    match args.iter().position(|a| *a == name) {
+        None => Ok(None),
+        Some(i) => args
+            .get(i + 1)
+            .copied()
+            .filter(|v| !v.starts_with("--"))
+            .map(Some)
+            .ok_or_else(|| format!("{name} needs a value")),
+    }
+}
+
+/// `phantomqa token ...`. Tokens go to stdout alone, so `TOKEN=$(phantomqa token add ci)` works.
+fn token_command(args: &[&str]) -> Result<String, String> {
+    let path = &config().tokens;
+    let now = now_secs();
+    let known = |allowed: &[&str]| -> Result<(), String> {
+        let mut rest = args.iter().skip(2);
+        while let Some(arg) = rest.next() {
+            if !allowed.contains(arg) {
+                return Err(format!("unexpected argument: {arg}\n\n{TOKEN_USAGE}"));
+            }
+            if *arg != "--old" {
+                rest.next();
+            }
+        }
+        Ok(())
+    };
+    match args {
+        ["add", name, ..] => {
+            known(&["--expires"])?;
+            let ttl = sub_option(args, "--expires")?
+                .map(parse_duration)
+                .transpose()?
+                .flatten();
+            let token = token_add(path, name, ttl, now)?;
+            eprintln!("Token {name:?} created. Copy it now; it is not shown again.");
+            Ok(format!("{token}\n"))
+        }
+        ["rotate", name, ..] => {
+            known(&["--grace", "--expires"])?;
+            let grace = match sub_option(args, "--grace")? {
+                None => 0,
+                Some(g) => parse_duration(g)?.ok_or("--grace needs a duration, not never")?,
+            };
+            let ttl = sub_option(args, "--expires")?.map(parse_duration).transpose()?;
+            let token = token_rotate(path, name, grace, ttl, now)?;
+            if grace == 0 {
+                eprintln!("Token {name:?} rotated. The old token no longer works. Copy the new one now.");
+            } else {
+                eprintln!(
+                    "Token {name:?} rotated. The old token works until {}.",
+                    utc_date(now + grace)
+                );
+            }
+            Ok(format!("{token}\n"))
+        }
+        ["remove", name, ..] => {
+            known(&["--old"])?;
+            let removed = token_remove(path, name, args.contains(&"--old"), now)?;
+            Ok(format!(
+                "Removed {removed} token(s) named {name:?}. They no longer work.\n"
+            ))
+        }
+        ["list"] => load_tokens(path).map(|entries| render_token_list(&entries, now)),
+        ["check"] => {
+            // From stdin, so the token stays out of shell history and the process list.
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+            match authorize(path, Some(&format!("Bearer {}", input.trim()))) {
+                Ok(name) => Ok(format!("ok: token {name:?}\n")),
+                Err(denied) => Err(format!("refused: {denied:?}")),
+            }
+        }
+        _ => Err(TOKEN_USAGE.to_string()),
+    }
+}
+
 // ---------------------------------------------------------------- doctor
 
 /// Prints one line per check. Returns false if something required is missing.
@@ -1951,6 +2419,7 @@ commands:
   back                press back
   launch PACKAGE      start an app
   crashes             list crashes and ANRs in the device's crash log
+  token ...           API tokens: add, rotate, remove, list, check (see `phantomqa token`)
 
 options (each also has an env var):
   --adb PATH          adb binary            ADB  (default: $ANDROID_HOME/platform-tools/adb, then PATH)
@@ -1958,11 +2427,16 @@ options (each also has an env var):
   --reports DIR       reports folder        PHANTOMQA_REPORTS  (default: reports)
   --ffmpeg PATH       ffmpeg, optional      FFMPEG  (default: PATH)
   --no-video          do not record video   PHANTOMQA_VIDEO=0
-  --no-screenshots    no screenshots        PHANTOMQA_SCREENSHOTS=0";
+  --no-screenshots    no screenshots        PHANTOMQA_SCREENSHOTS=0
+  --tokens PATH       API tokens file       PHANTOMQA_TOKENS  (default: tokens.json)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if args
+        .iter()
+        .take_while(|a| a.starts_with('-'))
+        .any(|a| a == "--help" || a == "-h")
+    {
         println!("{USAGE}");
         return;
     }
@@ -1986,6 +2460,7 @@ fn main() {
             return;
         }
         ["doctor"] => std::process::exit(if doctor() { 0 } else { 1 }),
+        ["token", ref rest @ ..] => token_command(rest),
         ["crashes"] => read_crash_log(None).map(|log| {
             let crashes = parse_crashes(&log);
             if crashes.is_empty() {
@@ -2488,5 +2963,261 @@ mod tests {
         let report = fs::read_to_string(root.join("run-001").join("report.md")).unwrap();
         assert!(report.contains("## Bug 2: t"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // ------------------------------------------------------------ tokens
+
+    fn token_dir(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("phantomqa-tokens-{test}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    const NOW: u64 = 1_794_377_174;
+    const HOUR: u64 = 3600;
+
+    #[test]
+    fn token_format_is_strict() {
+        let entries = Vec::new();
+        let (entry, token) = new_token("ci", None, NOW, &entries).unwrap();
+        assert!(token.starts_with("pqa_"));
+        assert_eq!(token.len(), 4 + 16 + 1 + 64);
+        let (id, secret) = parse_token(&token).unwrap();
+        assert_eq!(id, entry.id);
+        assert_eq!(secret.len(), 64);
+        assert_eq!(entry.hash, hash_token(&token));
+        assert!(entry.hash.starts_with("sha256:") && !entry.hash.contains(secret));
+
+        let good = format!("pqa_{}_{}", "a".repeat(16), "b".repeat(64));
+        assert!(parse_token(&good).is_some());
+        for bad in [
+            String::new(),
+            "pqa_".into(),
+            format!("pqx_{}_{}", "a".repeat(16), "b".repeat(64)),
+            format!("pqa_{}_{}", "A".repeat(16), "b".repeat(64)),
+            format!("pqa_{}_{}", "a".repeat(15), "b".repeat(64)),
+            format!("pqa_{}_{}", "a".repeat(16), "b".repeat(63)),
+            format!("pqa_{}_{}_", "a".repeat(16), "b".repeat(64)),
+            format!("pqa_{}{}", "a".repeat(16), "b".repeat(64)),
+            format!("pqa_{}_{}", "g".repeat(16), "b".repeat(64)),
+            format!("pqa_{}_{} ", "a".repeat(16), "b".repeat(64)),
+            format!("pqa_{}_{}é", "a".repeat(16), "b".repeat(63)),
+        ] {
+            assert!(parse_token(&bad).is_none(), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn reads_bearer_headers() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("  bearer   abc  "), Some("abc"));
+        assert_eq!(bearer_token("BEARER\tabc"), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Bearer "), None);
+        assert_eq!(bearer_token("Bearer a b"), None);
+        assert_eq!(bearer_token("abc"), None);
+        assert_eq!(bearer_token(&format!("Bearer {}", "a".repeat(600))), None);
+    }
+
+    #[test]
+    fn add_check_and_revoke() {
+        let dir = token_dir("revoke");
+        let path = dir.join("tokens.json");
+        let token = token_add(&path, "dashboard", None, NOW).unwrap();
+        let header = format!("Bearer {token}");
+        assert_eq!(authorize(&path, Some(&header)), Ok("dashboard".into()));
+
+        // Same id, wrong secret.
+        let (id, _) = parse_token(&token).unwrap();
+        let forged = format!("pqa_{id}_{}", "0".repeat(64));
+        let entries = load_tokens(&path).unwrap();
+        assert_eq!(check_token(&entries, &forged, NOW), Err(TokenDenied::Unknown));
+        assert_eq!(authorize(&path, None), Err(TokenDenied::Missing));
+        assert_eq!(authorize(&path, Some("Bearer nope")), Err(TokenDenied::Malformed));
+
+        // Never stored in clear text.
+        let file = fs::read_to_string(&path).unwrap();
+        assert!(!file.contains(&token[TOKEN_PREFIX.len() + 17..]));
+
+        assert_eq!(token_remove(&path, "dashboard", false, NOW), Ok(1));
+        assert!(matches!(authorize(&path, Some(&header)), Err(TokenDenied::NoTokens(_))));
+        assert!(token_remove(&path, "dashboard", false, NOW).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rotates_with_and_without_grace() {
+        let dir = token_dir("rotate");
+        let path = dir.join("tokens.json");
+        let first = token_add(&path, "ci", Some(30 * 24 * HOUR), NOW).unwrap();
+
+        // No grace: the old token stops at once; the lifetime carries over.
+        let second = token_rotate(&path, "ci", 0, None, NOW).unwrap();
+        let entries = load_tokens(&path).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].expires, Some(NOW + 30 * 24 * HOUR));
+        assert_eq!(check_token(&entries, &first, NOW), Err(TokenDenied::Unknown));
+        assert_eq!(check_token(&entries, &second, NOW), Ok("ci".into()));
+
+        // One hour of grace: both work, then only the new one.
+        let third = token_rotate(&path, "ci", HOUR, Some(None), NOW).unwrap();
+        let entries = load_tokens(&path).unwrap();
+        assert_eq!(check_token(&entries, &second, NOW + HOUR - 1), Ok("ci".into()));
+        assert_eq!(check_token(&entries, &third, NOW + HOUR - 1), Ok("ci".into()));
+        assert_eq!(check_token(&entries, &second, NOW + HOUR), Err(TokenDenied::Expired));
+        assert_eq!(
+            check_token(&entries, &third, NOW + 365 * 24 * HOUR),
+            Ok("ci".into()),
+            "--expires never"
+        );
+        assert!(render_token_list(&entries, NOW).contains("old key, works until"));
+
+        // Rotating again during grace keeps a single new key.
+        let fourth = token_rotate(&path, "ci", HOUR, None, NOW + 60).unwrap();
+        let entries = load_tokens(&path).unwrap();
+        assert_eq!(entries.iter().filter(|e| !e.rotated).count(), 1);
+        assert_eq!(check_token(&entries, &fourth, NOW + 60), Ok("ci".into()));
+        // The first grace window is not extended by the second rotation.
+        assert_eq!(check_token(&entries, &second, NOW + HOUR), Err(TokenDenied::Expired));
+
+        // End the grace early.
+        assert_eq!(token_remove(&path, "ci", true, NOW + 120), Ok(2));
+        let entries = load_tokens(&path).unwrap();
+        assert_eq!(check_token(&entries, &third, NOW + 120), Err(TokenDenied::Unknown));
+        assert_eq!(check_token(&entries, &fourth, NOW + 120), Ok("ci".into()));
+        assert!(token_remove(&path, "ci", true, NOW + 120).is_err());
+        assert!(token_rotate(&path, "missing", 0, None, NOW).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn expired_tokens_are_refused_and_cleaned_up() {
+        let dir = token_dir("expire");
+        let path = dir.join("tokens.json");
+        let token = token_add(&path, "short", Some(HOUR), NOW).unwrap();
+        let entries = load_tokens(&path).unwrap();
+        assert_eq!(check_token(&entries, &token, NOW + HOUR - 1), Ok("short".into()));
+        assert_eq!(check_token(&entries, &token, NOW + HOUR), Err(TokenDenied::Expired));
+        assert!(render_token_list(&entries, NOW + HOUR).contains("expired"));
+        // Any later change drops it, and its name can be used again.
+        token_add(&path, "short", None, NOW + HOUR).unwrap();
+        assert_eq!(load_tokens(&path).unwrap().len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_bad_names_durations_and_duplicates() {
+        let dir = token_dir("names");
+        let path = dir.join("tokens.json");
+        for bad in ["", "has space", "slash/name", "ünï", &"x".repeat(65)] {
+            assert!(token_add(&path, bad, None, NOW).is_err(), "{bad:?}");
+        }
+        token_add(&path, "ci.main-2_b", None, NOW).unwrap();
+        assert!(
+            token_add(&path, "ci.main-2_b", None, NOW)
+                .unwrap_err()
+                .contains("rotate")
+        );
+
+        assert_eq!(parse_duration("90m"), Ok(Some(90 * 60)));
+        assert_eq!(parse_duration("12h"), Ok(Some(12 * HOUR)));
+        assert_eq!(parse_duration("30d"), Ok(Some(30 * 24 * HOUR)));
+        assert_eq!(parse_duration("never"), Ok(None));
+        for bad in ["", "5", "0d", "-1d", "1y", "d", "1.5h", "99999999999999999999d"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?}");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn broken_or_missing_files_refuse_everything() {
+        let dir = token_dir("broken");
+        let path = dir.join("tokens.json");
+        let token = format!("pqa_{}_{}", "a".repeat(16), "b".repeat(64));
+        let header = format!("Bearer {token}");
+        assert!(
+            matches!(authorize(&path, Some(&header)), Err(TokenDenied::NoTokens(_))),
+            "missing file"
+        );
+
+        for broken in [
+            "not json",
+            "{}",
+            r#"{"version": 2, "tokens": []}"#,
+            r#"{"version": 1}"#,
+            r#"{"version": 1, "tokens": [{"name": "x"}]}"#,
+            r#"{"version": 1, "tokens": [{"name": "bad name", "id": "a", "hash": "b"}]}"#,
+        ] {
+            fs::write(&path, broken).unwrap();
+            assert!(load_tokens(&path).is_err(), "{broken}");
+            assert!(matches!(authorize(&path, Some(&header)), Err(TokenDenied::NoTokens(_))));
+            // Changes refuse to overwrite a broken file.
+            assert!(token_add(&path, "new", None, NOW).is_err());
+        }
+
+        // A hash made another way never matches.
+        let entry = json!({"name": "x", "id": "a".repeat(16), "hash": format!("md5:{}", "0".repeat(32))});
+        fs::write(&path, json!({"version": 1, "tokens": [entry]}).to_string()).unwrap();
+        assert_eq!(authorize(&path, Some(&header)), Err(TokenDenied::Unknown));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tokens_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = token_dir("private");
+        let path = dir.join("tokens.json");
+        token_add(&path, "ci", None, NOW).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!dir.join("tokens.json.lock").exists(), "lock released");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn parallel_changes_are_not_lost() {
+        let dir = token_dir("parallel");
+        let path = dir.join("tokens.json");
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || token_add(&path, &format!("t{i}"), None, NOW).unwrap())
+            })
+            .collect();
+        let tokens: Vec<String> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let entries = load_tokens(&path).unwrap();
+        assert_eq!(entries.len(), 8);
+        for (i, token) in tokens.iter().enumerate() {
+            assert_eq!(check_token(&entries, token, NOW), Ok(format!("t{i}")));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_lock_from_a_killed_command_is_removed() {
+        let dir = token_dir("stale");
+        let path = dir.join("tokens.json");
+        let lock = dir.join("tokens.json.lock");
+        fs::write(&lock, b"").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(120);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        token_add(&path, "ci", None, NOW).unwrap();
+        assert!(!lock.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn formats_utc_dates() {
+        assert_eq!(utc_date(0), "1970-01-01 00:00 UTC");
+        assert_eq!(utc_date(NOW), "2026-11-11 06:06 UTC");
+        assert_eq!(utc_date(951_782_400), "2000-02-29 00:00 UTC");
+        assert_eq!(utc_date(4_102_444_800), "2100-01-01 00:00 UTC");
     }
 }

@@ -102,6 +102,24 @@ In an MCP session, PhantomQA records the screen with `screenrecord` in 30-second
 - If PhantomQA is killed instead of closed, `session.mp4` is not made; the parts stay in `video/`.
 - Turn video off with `--no-video`, screenshots with `--no-screenshots`.
 
+## API tokens
+
+Tokens will protect the HTTP API (next step). Give each client, such as a dashboard or CI, its own token.
+
+```sh
+phantomqa token add dashboard --expires 90d   # prints pqa_... once; store it in the dashboard
+phantomqa token list                          # names, ids and expiry, never the tokens
+phantomqa token rotate dashboard --grace 1h   # new token; the old one works for 1 more hour
+phantomqa token remove dashboard --old        # end that hour early
+phantomqa token remove dashboard              # revoke now
+echo "$TOKEN" | phantomqa token check         # does this token work?
+```
+
+- Clients send `Authorization: Bearer pqa_...`.
+- `tokens.json` keeps only SHA-256 hashes, is readable only by you, and is written atomically under a lock.
+- Removing or rotating a token takes effect on the next request. A broken `tokens.json` refuses every token.
+- Tokens go to stdout alone, so `TOKEN=$(phantomqa token add ci)` works.
+
 ## Options
 
 Put options before the command. Each option also has an env var, which is handy in MCP configs. An option wins over its env var.
@@ -114,6 +132,7 @@ Put options before the command. Each option also has an env var, which is handy 
 | `--ffmpeg PATH` | `FFMPEG` | `ffmpeg` on PATH |
 | `--no-video` | `PHANTOMQA_VIDEO=0` | video on |
 | `--no-screenshots` | `PHANTOMQA_SCREENSHOTS=0` | screenshots on |
+| `--tokens PATH` | `PHANTOMQA_TOKENS` | `tokens.json` |
 
 Example: `phantomqa --serial emulator-5554 --reports ~/qa --no-video mcp`
 
