@@ -6,6 +6,7 @@
 //! Everything goes through `adb`. Run `phantomqa doctor` to check the setup.
 //! Bug reports go to ./reports/run-NNN/. See `phantomqa --help` for the paths you can set.
 
+use jiff::{Timestamp, tz::TimeZone};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -133,6 +134,8 @@ struct Config {
     tokens: PathBuf,
     /// Claude Code, the agent `phantomqa run` starts.
     claude: String,
+    /// routines.json: the tests `serve` runs on a schedule.
+    routines: PathBuf,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -147,7 +150,8 @@ fn env_var(name: &str) -> Option<String> {
 
 /// Reads the options before the command. Returns the config and where the command starts.
 fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<(Config, usize), String> {
-    let (mut adb, mut ffmpeg, mut reports, mut serial, mut tokens, mut claude) = (None, None, None, None, None, None);
+    let (mut adb, mut ffmpeg, mut reports, mut serial, mut tokens, mut claude, mut routines) =
+        (None, None, None, None, None, None, None);
     let (mut no_video, mut no_screenshots) = (false, false);
     let mut i = 0;
     while let Some(arg) = args.get(i).filter(|a| a.starts_with("--")) {
@@ -179,6 +183,7 @@ fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<
             "--serial" => &mut serial,
             "--tokens" => &mut tokens,
             "--claude" => &mut claude,
+            "--routines" => &mut routines,
             _ => return Err(format!("unknown option: {name}")),
         };
         let value = match inline {
@@ -226,6 +231,14 @@ fn load_config(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<
         claude: claude
             .or_else(|| env("PHANTOMQA_CLAUDE"))
             .unwrap_or_else(|| "claude".into()),
+        routines: {
+            let routines = PathBuf::from(
+                routines
+                    .or_else(|| env("PHANTOMQA_ROUTINES"))
+                    .unwrap_or_else(|| "routines.json".into()),
+            );
+            std::path::absolute(&routines).unwrap_or(routines)
+        },
     };
     Ok((config, i))
 }
@@ -1189,7 +1202,13 @@ fn create_run(root: &Path, test: Value) -> Result<Report, String> {
     };
     let device = device_name().unwrap_or_else(|_| "unknown".into());
     let mut header = format!("# PhantomQA test report: run {run}\n\n- Device: {device}\n");
-    for (key, label) in [("app", "App"), ("file", "Test"), ("goal", "Goal"), ("model", "Model")] {
+    for (key, label) in [
+        ("app", "App"),
+        ("file", "Test"),
+        ("routine", "Routine"),
+        ("goal", "Goal"),
+        ("model", "Model"),
+    ] {
         if let Some(value) = test[key].as_str() {
             header.push_str(&format!("- {label}: {}\n", one_line(value, 300)));
         }
@@ -1280,6 +1299,11 @@ fn write_run_json(report: &Report) -> Result<(), String> {
 }
 
 /// Logs to stderr. Never panics: the agent may have closed the pipe.
+/// A line on stdout. Unlike println!, it does not panic when the reader went away (`| head`).
+fn say(line: &str) {
+    let _ = writeln!(std::io::stdout(), "{line}");
+}
+
 fn warn(message: &str) {
     let _ = writeln!(std::io::stderr(), "phantomqa: {message}");
 }
@@ -2761,7 +2785,7 @@ fn route(req: &ApiRequest, reports: &Path, tokens: &Path) -> (Reply, Option<Stri
     let name = match authorize(tokens, req.authorization) {
         Ok(name) => name,
         Err(denied) => {
-            eprintln!("phantomqa: refused {}: {denied:?}", path);
+            let _ = writeln!(std::io::stderr(), "phantomqa: refused {}: {denied:?}", path);
             let mut reply = Reply::error(401, "unauthorized", "send a valid token: Authorization: Bearer pqa_...");
             reply
                 .headers
@@ -3051,12 +3075,23 @@ fn serve(args: &[&str]) -> Result<String, String> {
 
     let server = tiny_http::Server::http(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
     let server = Arc::new(server);
-    eprintln!("PhantomQA API on http://{addr}");
-    eprintln!("  reports: {}", config.reports.display());
-    eprintln!("  tokens:  {} ({active} active)", config.tokens.display());
+    let _ = writeln!(std::io::stderr(), "PhantomQA API on http://{addr}");
+    let _ = writeln!(std::io::stderr(), "  reports: {}", config.reports.display());
+    let _ = writeln!(
+        std::io::stderr(),
+        "  tokens:  {} ({active} active)",
+        config.tokens.display()
+    );
+    let _ = writeln!(std::io::stderr(), "  routines: {}", config.routines.display());
     if !addr.ip().is_loopback() {
-        eprintln!("  warning: listening beyond this machine over plain HTTP; put an HTTPS proxy in front");
+        let _ = writeln!(
+            std::io::stderr(),
+            "  warning: listening beyond this machine over plain HTTP; put an HTTPS proxy in front"
+        );
     }
+    std::thread::Builder::new()
+        .spawn(|| run_routines(&config.routines))
+        .map_err(|e| format!("cannot start the routines: {e}"))?;
     let workers: Vec<_> = (0..SERVER_THREADS)
         .map(|_| {
             let server = server.clone();
@@ -3094,7 +3129,12 @@ fn handle_http(request: tiny_http::Request, reports: &Path, tokens: &Path) {
     let (reply, who) = route(&req, reports, tokens);
 
     let path = url.split('?').next().unwrap_or("");
-    eprintln!("{method} {path} {} {}", reply.status, who.as_deref().unwrap_or("-"));
+    let _ = writeln!(
+        std::io::stderr(),
+        "{method} {path} {} {}",
+        reply.status,
+        who.as_deref().unwrap_or("-")
+    );
     let headers: Vec<tiny_http::Header> = reply
         .headers
         .iter()
@@ -3127,7 +3167,7 @@ fn handle_http(request: tiny_http::Request, reports: &Path, tokens: &Path) {
     };
     if let Err(e) = result {
         // Usually the client went away mid-download.
-        eprintln!("phantomqa: could not send {path}: {e}");
+        let _ = writeln!(std::io::stderr(), "phantomqa: could not send {path}: {e}");
     }
 }
 
@@ -3466,6 +3506,7 @@ fn run_claude(test: &TestFile, run_dir: &Path, mcp_file: &Path) -> AgentRun {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    stop_with_parent(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return failed(format!("cannot run {claude}: {e}")),
@@ -3549,6 +3590,37 @@ fn run_claude(test: &TestFile, run_dir: &Path, mcp_file: &Path) -> AgentRun {
     }
 }
 
+/// Linux: the agent gets SIGTERM when the thread that started it dies, for example when phantomqa
+/// is killed. Otherwise the agent would go on without a time limit.
+#[cfg(target_os = "linux")]
+fn stop_with_parent(command: &mut Command) {
+    use std::ffi::{c_int, c_ulong};
+    use std::os::unix::process::CommandExt;
+    unsafe extern "C" {
+        fn prctl(option: c_int, ...) -> c_int;
+    }
+    const PR_SET_PDEATHSIG: c_int = 1;
+    const SIGTERM: c_ulong = 15;
+    const ESRCH: i32 = 3;
+    let parent = std::process::id();
+    // SAFETY: this runs between fork and exec. It only makes system calls, with no allocation.
+    unsafe {
+        command.pre_exec(move || {
+            if prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // phantomqa died before prctl: do not start the agent at all.
+            if std::os::unix::process::parent_id() != parent {
+                return Err(std::io::Error::from_raw_os_error(ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn stop_with_parent(_: &mut Command) {}
+
 /// Waits until the worker has finished the session, or is gone.
 fn wait_for_finish(run_dir: &Path) -> bool {
     let start = Instant::now();
@@ -3565,10 +3637,9 @@ fn wait_for_finish(run_dir: &Path) -> bool {
     }
 }
 
-/// `phantomqa run FILE`. Returns the summary and the exit code: 0 no bugs, 1 bugs, 2 failed.
-fn run_test(path: &str) -> Result<(String, i32), String> {
-    let config = config();
-    let test = load_test(Path::new(path))?;
+/// Reads a test file and checks that its password env var is ready, before anything starts.
+fn check_test(path: &Path) -> Result<TestFile, String> {
+    let test = load_test(path)?;
     if let Some(login) = &test.login {
         let name = &login.password_env;
         let password = env_var(name).ok_or_else(|| {
@@ -3580,6 +3651,14 @@ fn run_test(path: &str) -> Result<(String, i32), String> {
             ));
         }
     }
+    Ok(test)
+}
+
+/// `phantomqa run FILE`, and each routine. Returns the summary and the exit code: 0 no bugs,
+/// 1 bugs, 2 failed. `routine` is the routine that started it, for run.json.
+fn run_test(path: &Path, routine: Option<&str>) -> Result<(String, i32), String> {
+    let config = config();
+    let test = check_test(path)?;
     first_line(&config.claude, "--version")
         .map_err(|e| format!("{e}. Install Claude Code, or set --claude or PHANTOMQA_CLAUDE."))?;
     let _device = device_lock()?;
@@ -3594,7 +3673,11 @@ fn run_test(path: &str) -> Result<(String, i32), String> {
         None => {}
     }
 
-    let mut report = create_run(&config.reports, test.to_json())?;
+    let mut info = test.to_json();
+    if let Some(name) = routine {
+        info["routine"] = json!(name);
+    }
+    let mut report = create_run(&config.reports, info)?;
     let dir = report.dir.clone();
     let mcp_file = dir.join(".mcp.json");
     write_json(&mcp_file, &mcp_config(&dir)?)?;
@@ -3670,6 +3753,471 @@ fn run_test(path: &str) -> Result<(String, i32), String> {
     Ok((line, code))
 }
 
+// ---------------------------------------------------------------- routines
+//
+// `phantomqa serve` also runs the tests in routines.json on a schedule:
+//
+//   {"routines": [
+//     {"name": "nightly", "test": "shop.json", "at": "03:00"},
+//     {"name": "smoke", "test": "smoke.json", "every": "6h"}
+//   ]}
+//
+// Times are the machine's local time (TZ, then /etc/localtime). `every` counts from midnight, so
+// "6h" is 00:00, 06:00, 12:00 and 18:00. serve reads the file every second; a broken file runs
+// nothing until it is fixed. Times that pass while the machine sleeps or serve is down are not
+// made up. A routine whose last run is still going skips its turn, and so does a busy device.
+
+const ROUTINE_FIELDS: [&str; 4] = ["name", "test", "at", "every"];
+/// A routine starts if its time passed at most this many seconds ago. Older times count as missed.
+const ROUTINE_GRACE: i64 = 60;
+const MAX_ROUTINES_FILE: u64 = 1024 * 1024;
+const DAY_MINUTES: u32 = 24 * 60;
+const ROUTINES_EXAMPLE: &str = r#"{"routines": [{"name": "nightly", "test": "shop.json", "at": "03:00"}]}"#;
+
+/// When a routine runs, on the local wall clock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum When {
+    /// Once a day, at this minute of the day.
+    At(u32),
+    /// Every this many minutes from midnight. It splits a day evenly.
+    Every(u32),
+}
+
+impl When {
+    fn describe(self) -> String {
+        match self {
+            When::At(m) => format!("at {:02}:{:02}", m / 60, m % 60),
+            When::Every(n) if n % 60 == 0 => format!("every {}h", n / 60),
+            When::Every(n) => format!("every {n}m"),
+        }
+    }
+
+    /// The minutes of a day it runs at.
+    fn minutes(self) -> Vec<u32> {
+        match self {
+            When::At(m) => vec![m],
+            When::Every(n) => (0..DAY_MINUTES).step_by(n as usize).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Routine {
+    name: String,
+    /// Relative paths in routines.json are relative to routines.json.
+    test: PathBuf,
+    when: When,
+}
+
+/// The text of routines.json. Ok(None) when there is no such file.
+fn read_routines_file(path: &Path) -> Result<Option<String>, String> {
+    let shown = path.display();
+    let missing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    match fs::metadata(path) {
+        Err(e) if missing(&e) => return Ok(None),
+        Err(e) => return Err(format!("cannot read {shown}: {e}")),
+        Ok(meta) if !meta.is_file() => return Err(format!("{shown} is not a file")),
+        Ok(meta) if meta.len() > MAX_ROUTINES_FILE => return Err(format!("{shown} is bigger than 1 MB")),
+        Ok(_) => {}
+    }
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if missing(&e) => Ok(None),
+        Err(e) => Err(format!("cannot read {shown}: {e}")),
+    }
+}
+
+/// Checks every routine. Unknown fields are errors, and so is a name used twice.
+fn parse_routines(text: &str, base: &Path) -> Result<Vec<Routine>, String> {
+    let doc: Value = serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
+    let obj = doc
+        .as_object()
+        .ok_or_else(|| format!("must be a JSON object, like {ROUTINES_EXAMPLE}"))?;
+    if let Some(key) = obj.keys().find(|k| *k != "routines") {
+        return Err(format!("unknown field {key:?}; the file has only \"routines\""));
+    }
+    let Some(Value::Array(items)) = obj.get("routines") else {
+        return Err(format!("\"routines\" must be a list, like {ROUTINES_EXAMPLE}"));
+    };
+    let mut routines: Vec<Routine> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let which = match item["name"].as_str() {
+            Some(name) => format!("routine {name:?}"),
+            None => format!("routine {}", i + 1),
+        };
+        let routine = parse_routine(item, base).map_err(|e| format!("{which}: {e}"))?;
+        if routines.iter().any(|r| r.name == routine.name) {
+            return Err(format!("{which}: the name is used twice"));
+        }
+        routines.push(routine);
+    }
+    Ok(routines)
+}
+
+fn parse_routine(item: &Value, base: &Path) -> Result<Routine, String> {
+    let obj = item
+        .as_object()
+        .ok_or("must be an object, like {\"name\": \"nightly\", \"test\": \"shop.json\", \"at\": \"03:00\"}")?;
+    if let Some(key) = obj.keys().find(|k| !ROUTINE_FIELDS.contains(&k.as_str())) {
+        return Err(format!(
+            "unknown field {key:?}; the fields are {}",
+            ROUTINE_FIELDS.join(", ")
+        ));
+    }
+    let text = |key: &str| -> Result<Option<String>, String> {
+        match obj.get(key) {
+            None => Ok(None),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            Some(_) => Err(format!("{key:?} must be a non-empty string")),
+        }
+    };
+    let name = text("name")?.ok_or("\"name\" is required, like \"nightly\"")?;
+    if !valid_token_name(&name) {
+        return Err("\"name\" may have only letters, digits, '.', '_' and '-', up to 64".into());
+    }
+    let test = text("test")?.ok_or("\"test\" is required: the test file, like \"shop.json\"")?;
+    let when = match (text("at")?, text("every")?) {
+        (Some(at), None) => When::At(parse_at(&at)?),
+        (None, Some(every)) => When::Every(parse_every(&every)?),
+        (Some(_), Some(_)) => return Err("set \"at\" or \"every\", not both".into()),
+        (None, None) => return Err("needs \"at\", like \"03:00\", or \"every\", like \"6h\"".into()),
+    };
+    Ok(Routine {
+        name,
+        test: base.join(test),
+        when,
+    })
+}
+
+/// "03:00" or "3:00" -> minute of the day.
+fn parse_at(s: &str) -> Result<u32, String> {
+    let error = || format!("\"at\" must be a time of day from 00:00 to 23:59, like \"03:00\", not {s:?}");
+    let digits = |part: &str, len: std::ops::RangeInclusive<usize>| {
+        len.contains(&part.len()) && part.bytes().all(|b| b.is_ascii_digit())
+    };
+    let (hour, minute) = s.split_once(':').ok_or_else(error)?;
+    if !digits(hour, 1..=2) || !digits(minute, 2..=2) {
+        return Err(error());
+    }
+    let (hour, minute): (u32, u32) = (hour.parse().map_err(|_| error())?, minute.parse().map_err(|_| error())?);
+    if hour > 23 || minute > 59 {
+        return Err(error());
+    }
+    Ok(hour * 60 + minute)
+}
+
+/// "15m" or "6h" -> minutes. It must split a day evenly, so the times are the same every day.
+fn parse_every(s: &str) -> Result<u32, String> {
+    let error = || {
+        format!(
+            "\"every\" must be minutes or hours that split a day evenly, like \"15m\", \"30m\", \"2h\" or \"6h\", not {s:?}. For once a day, use \"at\"."
+        )
+    };
+    let unit = match s.chars().last() {
+        Some('m') => 1,
+        Some('h') => 60,
+        _ => return Err(error()),
+    };
+    let number = &s[..s.len() - 1];
+    if !(1..=4).contains(&number.len()) || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(error());
+    }
+    let minutes = number.parse::<u32>().map_err(|_| error())? * unit;
+    if minutes == 0 || minutes >= DAY_MINUTES || !DAY_MINUTES.is_multiple_of(minutes) {
+        return Err(error());
+    }
+    Ok(minutes)
+}
+
+/// The machine's time zone: TZ, then /etc/localtime. UTC, and why, when there is none.
+fn local_zone() -> (TimeZone, Option<String>) {
+    match TimeZone::try_system() {
+        Ok(tz) => (tz, None),
+        Err(e) => (
+            TimeZone::UTC,
+            Some(format!("cannot tell the local time zone ({e}), so routines use UTC")),
+        ),
+    }
+}
+
+/// "Asia/Tbilisi (+04:00)", for messages.
+fn zone_label(tz: &TimeZone, now: Timestamp) -> String {
+    let offset = now.to_zoned(tz.clone()).strftime("%:z").to_string();
+    match tz.iana_name() {
+        Some(name) => format!("{name} ({offset})"),
+        None => format!("UTC{offset}"),
+    }
+}
+
+/// "2026-11-12 03:00" on the local clock.
+fn local_time(t: Timestamp, tz: &TimeZone) -> String {
+    t.to_zoned(tz.clone()).strftime("%Y-%m-%d %H:%M").to_string()
+}
+
+/// The times a routine runs, from the day before `t` to two days after, on the zone's clock.
+/// A time that a clock change skips runs right after the change. A time that happens twice
+/// runs the first time.
+fn run_times(when: When, tz: &TimeZone, t: Timestamp) -> Vec<Timestamp> {
+    let today = t.to_zoned(tz.clone()).date();
+    let mut times = Vec::new();
+    for days in -1..=2 {
+        let Ok(date) = today.checked_add(jiff::Span::new().days(days)) else {
+            continue;
+        };
+        for minute in when.minutes() {
+            let wall = date.at((minute / 60) as i8, (minute % 60) as i8, 0, 0);
+            if let Ok(time) = tz.to_ambiguous_timestamp(wall).compatible() {
+                times.push(time);
+            }
+        }
+    }
+    times.sort();
+    times.dedup();
+    times
+}
+
+/// The last run time at or before `t`.
+fn last_time(when: When, tz: &TimeZone, t: Timestamp) -> Option<Timestamp> {
+    run_times(when, tz, t).into_iter().rfind(|time| *time <= t)
+}
+
+/// The first run time after `t`.
+fn next_time(when: When, tz: &TimeZone, t: Timestamp) -> Option<Timestamp> {
+    run_times(when, tz, t).into_iter().find(|time| *time > t)
+}
+
+/// Where one routine stands.
+#[derive(Debug, Clone, PartialEq)]
+struct Timer {
+    /// The run time handled last: started, skipped or missed.
+    last: Option<Timestamp>,
+    next: Option<Timestamp>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Due {
+    Run(Timestamp),
+    Missed(Timestamp),
+}
+
+/// A new routine waits for its next time, even when one passed a moment ago.
+fn new_timer(when: When, tz: &TimeZone, now: Timestamp) -> Timer {
+    Timer {
+        last: last_time(when, tz, now),
+        next: next_time(when, tz, now),
+    }
+}
+
+/// One check, every second. `before` is the time of the check before.
+fn tick(timer: &mut Timer, when: When, tz: &TimeZone, before: Timestamp, now: Timestamp) -> Option<Due> {
+    if now < before {
+        // The clock went back. Wait for the next time from here; `last` keeps the time that
+        // already ran from running twice.
+        timer.next = next_time(when, tz, now);
+    }
+    let Some(next) = timer.next else {
+        timer.next = next_time(when, tz, now);
+        return None;
+    };
+    if now < next {
+        return None;
+    }
+    timer.next = next_time(when, tz, now);
+    let time = last_time(when, tz, now)?;
+    if timer.last == Some(time) {
+        return None;
+    }
+    timer.last = Some(time);
+    // After sleep, or a clock jump forward, only the latest passed time counts, once.
+    if now.as_second() - time.as_second() > ROUTINE_GRACE {
+        Some(Due::Missed(time))
+    } else {
+        Some(Due::Run(time))
+    }
+}
+
+/// Takes a routine off the running list when its thread ends, even by a panic.
+struct Running(Arc<Mutex<Vec<String>>>, String);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let mut list = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|name| *name != self.1);
+    }
+}
+
+fn start_routine(routine: &Routine, running: &Arc<Mutex<Vec<String>>>) {
+    let name = routine.name.clone();
+    {
+        let mut list = running.lock().unwrap_or_else(|e| e.into_inner());
+        if list.contains(&name) {
+            warn(&format!("routine {name}: skipped, its last run is still going"));
+            return;
+        }
+        list.push(name.clone());
+    }
+    let guard = Running(running.clone(), name.clone());
+    let test = routine.test.clone();
+    warn(&format!("routine {name}: starting {}", test.display()));
+    let started = std::thread::Builder::new().spawn(move || {
+        let _guard = guard;
+        let outcome = match run_test(&test, Some(&name)) {
+            Ok((text, _)) => text.trim().replace('\n', "; "),
+            Err(e) => format!("did not run: {e}"),
+        };
+        warn(&format!("routine {name}: {outcome}"));
+    });
+    if let Err(e) = started {
+        warn(&format!(
+            "routine {}: did not run: cannot start a thread: {e}",
+            routine.name
+        ));
+    }
+}
+
+/// Runs the routines in `path` until serve stops. Says what it does on stderr.
+fn run_routines(path: &Path) {
+    let base = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let running: Arc<Mutex<Vec<String>>> = Arc::default();
+    // The file as last read, to notice changes.
+    let mut seen: Option<Result<Option<String>, String>> = None;
+    let mut routines: Vec<Routine> = Vec::new();
+    let mut timers: Vec<(String, When, Timer)> = Vec::new();
+    let (mut tz, mut zone_problem) = local_zone();
+    if let Some(problem) = &zone_problem {
+        warn(&format!("routines: {problem}"));
+    }
+    let mut before = Timestamp::now();
+    loop {
+        let now = Timestamp::now();
+        let (zone, problem) = local_zone();
+        if problem != zone_problem {
+            if let Some(problem) = &problem {
+                warn(&format!("routines: {problem}"));
+            }
+            zone_problem = problem;
+        }
+        if zone != tz {
+            tz = zone;
+            warn(&format!("routines: the time zone is now {}", zone_label(&tz, now)));
+            for (_, when, timer) in &mut timers {
+                timer.next = next_time(*when, &tz, before.min(now));
+            }
+        }
+
+        let file = read_routines_file(path);
+        if seen.as_ref() != Some(&file) {
+            let shown = path.display();
+            routines = match &file {
+                Ok(None) => {
+                    warn(&format!("routines: none, {shown} not found"));
+                    Vec::new()
+                }
+                Ok(Some(text)) => match parse_routines(text, &base) {
+                    Ok(list) => {
+                        let names: Vec<String> = list
+                            .iter()
+                            .map(|r| format!("{} ({})", r.name, r.when.describe()))
+                            .collect();
+                        warn(&format!(
+                            "routines: {} from {shown}, times in {}{}{}",
+                            list.len(),
+                            zone_label(&tz, now),
+                            if list.is_empty() { "" } else { ": " },
+                            names.join(", ")
+                        ));
+                        list
+                    }
+                    Err(e) => {
+                        warn(&format!(
+                            "routines: {shown}: {}. Running none until it is fixed.",
+                            e.trim_end_matches('.')
+                        ));
+                        Vec::new()
+                    }
+                },
+                Err(e) => {
+                    warn(&format!(
+                        "routines: {}. Running none until it is fixed.",
+                        e.trim_end_matches('.')
+                    ));
+                    Vec::new()
+                }
+            };
+            // A routine keeps its place if its schedule did not change. New ones wait for their next time.
+            timers.retain(|(name, when, _)| routines.iter().any(|r| r.name == *name && r.when == *when));
+            seen = Some(file);
+        }
+
+        for routine in &routines {
+            let i = match timers.iter().position(|(name, _, _)| *name == routine.name) {
+                Some(i) => i,
+                None => {
+                    timers.push((routine.name.clone(), routine.when, new_timer(routine.when, &tz, now)));
+                    timers.len() - 1
+                }
+            };
+            match tick(&mut timers[i].2, routine.when, &tz, before, now) {
+                Some(Due::Run(_)) => start_routine(routine, &running),
+                Some(Due::Missed(time)) => warn(&format!(
+                    "routine {}: missed {} (the machine was asleep, or its clock jumped); waiting for the next time",
+                    routine.name,
+                    local_time(time, &tz)
+                )),
+                None => {}
+            }
+        }
+        before = now;
+        sleep(Duration::from_secs(1));
+    }
+}
+
+/// `phantomqa routines`: checks routines.json and each test file, and says when each runs next.
+fn routines_check() -> bool {
+    let path = &config().routines;
+    let now = Timestamp::now();
+    let (tz, problem) = local_zone();
+    match problem {
+        Some(problem) => say(&format!(
+            "warn  time zone: {problem}\n      fix: set TZ to a zone name, like TZ=Europe/Berlin, or unset it"
+        )),
+        None => say(&format!(
+            "info  times are local: {}, now {}",
+            zone_label(&tz, now),
+            local_time(now, &tz)
+        )),
+    }
+    let base = path.parent().unwrap_or(Path::new("."));
+    let routines = read_routines_file(path)
+        .and_then(|text| text.ok_or_else(|| format!("{} not found", path.display())))
+        .and_then(|text| parse_routines(&text, base).map_err(|e| format!("{}: {e}", path.display())));
+    let routines = match routines {
+        Ok(routines) => routines,
+        Err(e) => {
+            say(&format!(
+                "FAIL  {e}\n      fix: see {ROUTINES_EXAMPLE}; set --routines or PHANTOMQA_ROUTINES for another file"
+            ));
+            return false;
+        }
+    };
+    if routines.is_empty() {
+        say(&format!("info  {}: no routines", path.display()));
+    }
+    let mut ok = true;
+    for routine in &routines {
+        let next = next_time(routine.when, &tz, now).map_or("never".into(), |t| local_time(t, &tz));
+        let what = format!("{}: {}, next {next}", routine.name, routine.when.describe());
+        match check_test(&routine.test) {
+            Ok(test) => say(&format!("ok    {what}: tests {} with {}", test.app, test.model)),
+            Err(e) => {
+                ok = false;
+                say(&format!("FAIL  {what}\n      {e}"));
+            }
+        }
+    }
+    ok
+}
+
 // ---------------------------------------------------------------- doctor
 
 /// Prints one line per check. Returns false if something required is missing.
@@ -3677,10 +4225,10 @@ fn doctor() -> bool {
     let config = config();
     let mut ok = true;
     let mut check = |required: bool, what: &str, result: Result<String, String>, fix: &str| match result {
-        Ok(detail) => println!("ok    {what}: {detail}"),
+        Ok(detail) => say(&format!("ok    {what}: {detail}")),
         Err(error) => {
             let status = if required { "FAIL" } else { "warn" };
-            println!("{status:<5} {what}: {error}\n      fix: {fix}");
+            say(&format!("{status:<5} {what}: {error}\n      fix: {fix}"));
             ok &= !required;
         }
     };
@@ -3771,11 +4319,11 @@ fn doctor() -> bool {
     );
 
     let on_off = |on: bool| if on { "on" } else { "off" };
-    println!(
+    say(&format!(
         "info  video: {}, screenshots: {}",
         on_off(config.video),
         on_off(config.screenshots)
-    );
+    ));
     ok
 }
 
@@ -3794,7 +4342,9 @@ commands:
   launch PACKAGE      start an app
   crashes             list crashes and ANRs in the device's crash log
   token ...           API tokens: add, rotate, remove, list, check (see `phantomqa token`)
-  serve [--listen ADDR]  read-only HTTP API over the reports (default 127.0.0.1:7070, env PHANTOMQA_LISTEN)
+  serve [--listen ADDR]  read-only HTTP API over the reports (default 127.0.0.1:7070, env PHANTOMQA_LISTEN),
+                      and runs the tests in routines.json on schedule
+  routines            check routines.json and its test files, and show when each runs next
 
 options (each also has an env var):
   --adb PATH          adb binary            ADB  (default: $ANDROID_HOME/platform-tools/adb, then PATH)
@@ -3804,7 +4354,8 @@ options (each also has an env var):
   --no-video          do not record video   PHANTOMQA_VIDEO=0
   --no-screenshots    no screenshots        PHANTOMQA_SCREENSHOTS=0
   --tokens PATH       API tokens file       PHANTOMQA_TOKENS  (default: tokens.json)
-  --claude PATH       Claude Code, for run  PHANTOMQA_CLAUDE  (default: claude on PATH)";
+  --claude PATH       Claude Code, for run  PHANTOMQA_CLAUDE  (default: claude on PATH)
+  --routines PATH     scheduled tests       PHANTOMQA_ROUTINES  (default: routines.json)";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -3813,7 +4364,7 @@ fn main() {
         .take_while(|a| a.starts_with('-'))
         .any(|a| a == "--help" || a == "-h")
     {
-        println!("{USAGE}");
+        say(USAGE);
         return;
     }
     let start = match load_config(&args, &env_var) {
@@ -3839,9 +4390,9 @@ fn main() {
             serve_mcp(state);
             return;
         }
-        ["run", file] => match run_test(file) {
+        ["run", file] => match run_test(Path::new(file), None) {
             Ok((text, code)) => {
-                print!("{text}");
+                let _ = std::io::stdout().write_all(text.as_bytes());
                 std::process::exit(code);
             }
             Err(error) => {
@@ -3850,6 +4401,7 @@ fn main() {
             }
         },
         ["doctor"] => std::process::exit(if doctor() { 0 } else { 1 }),
+        ["routines"] => std::process::exit(if routines_check() { 0 } else { 1 }),
         ["token", ref rest @ ..] => token_command(rest),
         ["serve", ref rest @ ..] => serve(rest),
         ["crashes"] => read_crash_log(None).map(|log| {
@@ -3874,7 +4426,9 @@ fn main() {
         }
     };
     match result {
-        Ok(text) => print!("{text}"),
+        Ok(text) => {
+            let _ = std::io::stdout().write_all(text.as_bytes());
+        }
         Err(error) => {
             eprintln!("error: {error}");
             std::process::exit(1);
@@ -4207,10 +4761,16 @@ mod tests {
             "PHANTOMQA_REPORTS" => Some("env-reports".to_string()),
             "PHANTOMQA_VIDEO" => Some("0".to_string()),
             "PHANTOMQA_SCREENSHOTS" => Some("0".to_string()),
+            "PHANTOMQA_ROUTINES" => Some("env-routines.json".to_string()),
             _ => None,
         };
         let (config, _) = load_config(&[], &env).unwrap();
         assert_eq!(config.adb, "/env/adb");
+        assert!(config.routines.is_absolute() && config.routines.ends_with("env-routines.json"));
+        let (flagged, _) = load_config(&args(&["--routines", "/qa/r.json"]), &env).unwrap();
+        assert_eq!(flagged.routines, Path::new("/qa/r.json"));
+        let (plain, _) = load_config(&[], &|_: &str| None).unwrap();
+        assert!(plain.routines.ends_with("routines.json"));
         assert_eq!(config.ffmpeg.as_deref(), Some("/env/ffmpeg"));
         assert!(config.reports.ends_with("env-reports"));
         assert!(!config.video && !config.screenshots);
@@ -5212,5 +5772,305 @@ mod tests {
         lost.run_dir = Some(api.reports.join("run-009"));
         let reply = call_tool(&mut lost, &json!({"name": "back", "arguments": {}}));
         assert_eq!(reply["isError"], true, "no folder, no actions");
+    }
+
+    fn utc(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
+
+    /// The scheduler for one routine from `from` to `to`, one check every `step` seconds.
+    fn simulate(when: When, tz: &TimeZone, from: &str, to: &str, step: i64) -> Vec<Due> {
+        let (mut now, end) = (utc(from), utc(to));
+        let mut timer = new_timer(when, tz, now);
+        let mut before = now;
+        let mut out = Vec::new();
+        while now <= end {
+            out.extend(tick(&mut timer, when, tz, before, now));
+            before = now;
+            now = Timestamp::from_second(now.as_second() + step).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn reads_routines() {
+        let base = Path::new("/qa");
+        let list = parse_routines(
+            r#"{"routines": [
+                {"name": "nightly", "test": "shop.json", "at": "3:05"},
+                {"name": "smoke-1", "test": "/abs/smoke.json", "every": "90m"},
+                {"name": "often", "test": "t.json", "every": " 2h "}]}"#,
+            base,
+        )
+        .unwrap();
+        assert_eq!(
+            list[0],
+            Routine {
+                name: "nightly".into(),
+                test: "/qa/shop.json".into(),
+                when: When::At(185)
+            }
+        );
+        assert_eq!(list[1].test, Path::new("/abs/smoke.json"));
+        assert_eq!((list[1].when, list[2].when), (When::Every(90), When::Every(120)));
+        assert_eq!(When::At(185).describe(), "at 03:05");
+        assert_eq!(When::Every(120).describe(), "every 2h");
+        assert_eq!(When::Every(90).describe(), "every 90m");
+        assert!(parse_routines(r#"{"routines": []}"#, base).unwrap().is_empty());
+
+        for (every, minutes) in [
+            ("1m", 1),
+            ("15m", 15),
+            ("45m", 45),
+            ("60m", 60),
+            ("1h", 60),
+            ("8h", 480),
+            ("12h", 720),
+        ] {
+            assert_eq!(parse_every(every), Ok(minutes), "{every}");
+        }
+        for every in [
+            "0m", "7m", "25m", "5h", "24h", "1440m", "1d", "m", "6", "6H", "-6h", "+6h", "1.5h", "99999m", "６h",
+        ] {
+            assert!(parse_every(every).is_err(), "{every}");
+        }
+        assert_eq!(
+            (parse_at("00:00"), parse_at("23:59"), parse_at("7:30")),
+            (Ok(0), Ok(1439), Ok(450))
+        );
+        for at in [
+            "24:00",
+            "03:60",
+            "3",
+            "03:0",
+            "003:00",
+            "03:00:00",
+            "-1:00",
+            "3:00pm",
+            "03:００",
+            ":30",
+        ] {
+            assert!(parse_at(at).is_err(), "{at}");
+        }
+
+        let routine = |fields: &str| format!(r#"{{"routines": [{{{fields}}}]}}"#);
+        for (bad, why) in [
+            ("[]".to_string(), "must be a JSON object"),
+            ("{".into(), "not valid JSON"),
+            ("{}".into(), "\"routines\" must be a list"),
+            (r#"{"routines": {}}"#.into(), "\"routines\" must be a list"),
+            (r#"{"routines": [], "more": 1}"#.into(), "unknown field \"more\""),
+            (r#"{"routines": ["x"]}"#.into(), "routine 1: must be an object"),
+            (routine(r#""test": "t.json", "at": "03:00""#), "routine 1: \"name\" is required"),
+            (routine(r#""name": 5, "test": "t.json", "at": "03:00""#), "routine 1: \"name\" must be a non-empty string"),
+            (routine(r#""name": "a b", "test": "t.json", "at": "03:00""#), "only letters"),
+            (routine(&format!(r#""name": "{}", "test": "t.json", "at": "03:00""#, "a".repeat(65))), "up to 64"),
+            (routine(r#""name": "a", "at": "03:00""#), "routine \"a\": \"test\" is required"),
+            (routine(r#""name": "a", "test": "t.json""#), "needs \"at\""),
+            (routine(r#""name": "a", "test": "t.json", "at": "03:00", "every": "6h""#), "not both"),
+            (routine(r#""name": "a", "test": "t.json", "at": "03:00", "every": null"#), "\"every\" must be a non-empty string"),
+            (routine(r#""name": "a", "test": "t.json", "at": 300"#), "\"at\" must be a non-empty string"),
+            (routine(r#""name": "a", "test": "t.json", "at": "25:00""#), "time of day"),
+            (routine(r#""name": "a", "test": "t.json", "every": "7m""#), "split a day evenly"),
+            (routine(r#""name": "a", "test": "t.json", "at": "03:00", "days": "mon""#), "unknown field \"days\""),
+            (
+                r#"{"routines": [{"name": "a", "test": "t.json", "at": "03:00"}, {"name": "a", "test": "u.json", "every": "1h"}]}"#.into(),
+                "routine \"a\": the name is used twice",
+            ),
+        ] {
+            let error = parse_routines(&bad, base).unwrap_err();
+            assert!(error.contains(why), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn example_routines_file_is_valid() {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/examples"));
+        let text = read_routines_file(&dir.join("routines.json")).unwrap().unwrap();
+        let routines = parse_routines(&text, dir).unwrap();
+        assert!(!routines.is_empty());
+        for routine in routines {
+            load_test(&routine.test).unwrap();
+        }
+    }
+
+    #[test]
+    fn reads_the_routines_file() {
+        let dir = std::env::temp_dir().join(format!("phantomqa-routines-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("routines.json");
+        assert_eq!(read_routines_file(&path), Ok(None), "no file, no routines");
+        fs::write(&path, "{}").unwrap();
+        assert_eq!(read_routines_file(&path), Ok(Some("{}".into())));
+        assert!(read_routines_file(&dir).unwrap_err().contains("is not a file"));
+        fs::write(&path, vec![b' '; MAX_ROUTINES_FILE as usize + 1]).unwrap();
+        assert!(read_routines_file(&path).unwrap_err().contains("bigger than 1 MB"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn routine_times_follow_the_local_clock() {
+        let t = utc("2026-11-11T13:00:00Z");
+        let zone = TimeZone::UTC;
+        assert_eq!(next_time(When::Every(360), &zone, t), Some(utc("2026-11-11T18:00:00Z")));
+        assert_eq!(last_time(When::Every(360), &zone, t), Some(utc("2026-11-11T12:00:00Z")));
+        assert_eq!(next_time(When::At(180), &zone, t), Some(utc("2026-11-12T03:00:00Z")));
+        assert_eq!(last_time(When::At(180), &zone, t), Some(utc("2026-11-11T03:00:00Z")));
+        let on = utc("2026-11-11T18:00:00Z");
+        assert_eq!(
+            last_time(When::Every(360), &zone, on),
+            Some(on),
+            "a time that is now has come"
+        );
+        assert_eq!(
+            next_time(When::Every(360), &zone, on),
+            Some(utc("2026-11-12T00:00:00Z"))
+        );
+        assert_eq!(
+            next_time(When::At(0), &zone, utc("2028-12-31T23:59:00Z")),
+            Some(utc("2029-01-01T00:00:00Z"))
+        );
+        assert_eq!(
+            next_time(When::At(0), &zone, utc("2028-02-28T12:00:00Z")),
+            Some(utc("2028-02-29T00:00:00Z"))
+        );
+
+        // 03:00 in Tbilisi (UTC+4) is 23:00 UTC the day before.
+        let tbilisi = TimeZone::posix("<+04>-4").unwrap();
+        assert_eq!(next_time(When::At(180), &tbilisi, t), Some(utc("2026-11-11T23:00:00Z")));
+        assert_eq!(
+            next_time(When::Every(360), &tbilisi, t),
+            Some(utc("2026-11-11T14:00:00Z"))
+        );
+        assert_eq!(local_time(t, &tbilisi), "2026-11-11 17:00");
+        assert_eq!(zone_label(&tbilisi, t), "UTC+04:00", "a zone without a name");
+        assert_eq!(zone_label(&zone, t), "UTC (+00:00)");
+    }
+
+    #[test]
+    fn routines_handle_daylight_saving() {
+        let new_york = TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        // 2026-03-08: 02:00 jumps to 03:00, so 02:30 runs at 03:30.
+        assert_eq!(
+            next_time(When::At(150), &new_york, utc("2026-03-08T05:00:00Z")),
+            Some(utc("2026-03-08T07:30:00Z"))
+        );
+        let runs = |times: &[&str]| -> Vec<Due> { times.iter().map(|t| Due::Run(utc(t))).collect() };
+        // Every 30m through that night: each time once, none twice.
+        assert_eq!(
+            simulate(
+                When::Every(30),
+                &new_york,
+                "2026-03-08T04:00:00Z",
+                "2026-03-08T09:00:30Z",
+                7
+            ),
+            runs(&[
+                "2026-03-08T04:30:00Z",
+                "2026-03-08T05:00:00Z",
+                "2026-03-08T05:30:00Z",
+                "2026-03-08T06:00:00Z",
+                "2026-03-08T06:30:00Z",
+                "2026-03-08T07:00:00Z",
+                "2026-03-08T07:30:00Z",
+                "2026-03-08T08:00:00Z",
+                "2026-03-08T08:30:00Z",
+                "2026-03-08T09:00:00Z",
+            ])
+        );
+        // 2026-11-01: 01:00 to 02:00 happens twice. 01:30 runs the first time only.
+        assert_eq!(
+            simulate(
+                When::At(90),
+                &new_york,
+                "2026-11-01T04:00:00Z",
+                "2026-11-01T08:00:00Z",
+                7
+            ),
+            runs(&["2026-11-01T05:30:00Z"])
+        );
+        assert_eq!(
+            simulate(
+                When::Every(30),
+                &new_york,
+                "2026-11-01T03:50:00Z",
+                "2026-11-01T07:30:30Z",
+                7
+            ),
+            runs(&[
+                "2026-11-01T04:00:00Z",
+                "2026-11-01T04:30:00Z",
+                "2026-11-01T05:00:00Z",
+                "2026-11-01T05:30:00Z",
+                "2026-11-01T07:00:00Z",
+                "2026-11-01T07:30:00Z",
+            ])
+        );
+    }
+
+    #[test]
+    fn routines_skip_missed_times_and_clock_jumps() {
+        let zone = TimeZone::UTC;
+        let when = When::At(180);
+        let mut timer = new_timer(when, &zone, utc("2026-11-11T03:00:00Z"));
+        let mut step = |before: &str, now: &str| tick(&mut timer, when, &zone, utc(before), utc(now));
+        assert_eq!(
+            step("2026-11-11T03:00:00Z", "2026-11-11T03:00:01Z"),
+            None,
+            "added at 03:00: waits for tomorrow"
+        );
+        assert_eq!(
+            step("2026-11-12T02:59:59Z", "2026-11-12T03:00:00Z"),
+            Some(Due::Run(utc("2026-11-12T03:00:00Z")))
+        );
+        assert_eq!(step("2026-11-12T03:00:00Z", "2026-11-12T03:00:01Z"), None, "once");
+        // The clock goes back half an hour: 03:00 does not run again.
+        assert_eq!(step("2026-11-12T03:00:01Z", "2026-11-12T02:30:01Z"), None);
+        assert_eq!(step("2026-11-12T02:59:59Z", "2026-11-12T03:00:02Z"), None, "not twice");
+        // Asleep from 02:00 to 05:00: 03:00 is missed, said once, and not made up.
+        assert_eq!(
+            step("2026-11-13T02:00:00Z", "2026-11-13T05:00:00Z"),
+            Some(Due::Missed(utc("2026-11-13T03:00:00Z")))
+        );
+        assert_eq!(step("2026-11-13T05:00:00Z", "2026-11-13T05:00:01Z"), None);
+        // Waking up less than a minute late still runs it; later is missed.
+        assert_eq!(
+            step("2026-11-14T02:00:00Z", "2026-11-14T03:01:00Z"),
+            Some(Due::Run(utc("2026-11-14T03:00:00Z")))
+        );
+        assert_eq!(
+            step("2026-11-15T02:00:00Z", "2026-11-15T03:01:01Z"),
+            Some(Due::Missed(utc("2026-11-15T03:00:00Z")))
+        );
+
+        // Every 15m, asleep for two hours: one missed note, then on time again.
+        let found = simulate(
+            When::Every(15),
+            &zone,
+            "2026-11-11T10:00:00Z",
+            "2026-11-11T10:20:00Z",
+            5,
+        );
+        assert_eq!(found, [Due::Run(utc("2026-11-11T10:15:00Z"))]);
+        let when = When::Every(15);
+        let mut timer = new_timer(when, &zone, utc("2026-11-11T10:00:00Z"));
+        let mut step = |before: &str, now: &str| tick(&mut timer, when, &zone, utc(before), utc(now));
+        assert_eq!(
+            step("2026-11-11T10:00:00Z", "2026-11-11T12:05:00Z"),
+            Some(Due::Missed(utc("2026-11-11T12:00:00Z")))
+        );
+        assert_eq!(
+            step("2026-11-11T12:05:00Z", "2026-11-11T12:15:00Z"),
+            Some(Due::Run(utc("2026-11-11T12:15:00Z")))
+        );
+    }
+
+    #[test]
+    fn running_list_frees_a_routine_when_it_ends() {
+        let running: Arc<Mutex<Vec<String>>> = Arc::default();
+        running.lock().unwrap().extend(["a".to_string(), "b".to_string()]);
+        drop(Running(running.clone(), "a".into()));
+        assert_eq!(*running.lock().unwrap(), ["b"]);
     }
 }

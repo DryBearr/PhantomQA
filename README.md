@@ -104,6 +104,44 @@ phantomqa run shop.json
 - One run per device at a time; a second run on the same device stops with "busy".
 - Try it on any emulator with [examples/settings.json](examples/settings.json).
 
+## Run tests on a schedule
+
+`phantomqa serve` also runs the tests listed in `routines.json`:
+
+```json
+{
+  "routines": [
+    {"name": "nightly", "test": "shop.json", "at": "03:00"},
+    {"name": "smoke", "test": "smoke.json", "every": "6h"}
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | letters, digits, `.`, `_` and `-`. Each name only once |
+| `test` | a test file, as for `run` (relative to `routines.json`) |
+| `at` | once a day at this time, like `"03:00"` |
+| `every` | minutes or hours that split a day evenly, counted from midnight. `"6h"` runs at 00:00, 06:00, 12:00 and 18:00 |
+
+Each routine has `at` or `every`, not both.
+
+```sh
+phantomqa routines   # check the file and each test file, and show when each runs next
+phantomqa serve      # run the routines, and the API
+```
+
+- Times are this machine's local time. Set `TZ` for another zone, like `TZ=UTC phantomqa serve`.
+- On clock-change days, a time that does not exist runs right after the change. A time that happens twice runs once.
+- `serve` reads the file every second, so changes apply at once. A broken file runs nothing until it is fixed, and `serve` says why.
+- If a routine's last run is still going, it skips its turn. If another run has the device, the routine skips too. `serve` logs each skip.
+- Times missed while the machine sleeps or `serve` is down are not made up. `serve` logs a missed time once.
+- Each run is a normal run folder. Its `test` in `run.json` has `"routine": "nightly"`, and `report.md` has a `Routine` line.
+- Set the test files' password env vars where `serve` runs.
+- `serve` needs one API token to start, even for routines only: `phantomqa token add local`.
+- If `serve` stops during a run, the agent stops too, and the run gets no `## Agent` part.
+- Try it with [examples/routines.json](examples/routines.json): `phantomqa --routines examples/routines.json routines`.
+
 ## Use by hand
 
 ```sh
@@ -197,6 +235,7 @@ Put options before the command. Each option also has an env var, which is handy 
 | `--no-screenshots` | `PHANTOMQA_SCREENSHOTS=0` | screenshots on |
 | `--tokens PATH` | `PHANTOMQA_TOKENS` | `tokens.json` |
 | `--claude PATH` | `PHANTOMQA_CLAUDE` | `claude` on PATH |
+| `--routines PATH` | `PHANTOMQA_ROUTINES` | `routines.json` |
 
 Example: `phantomqa --serial emulator-5554 --reports ~/qa --no-video mcp`
 

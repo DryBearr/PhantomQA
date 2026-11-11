@@ -1,0 +1,5 @@
+{
+  "routines": [
+    {"name": "settings-smoke", "test": "settings.json", "every": "6h"}
+  ]
+}

@@ -108,9 +108,10 @@
       },
       "Test": {
         "type": "object",
-        "description": "Only for runs started by `phantomqa run`: the test file's settings. Never the password.",
+        "description": "Only for runs started by `phantomqa run` or a routine: the test file's settings. Never the password.",
         "properties": {
           "file": { "type": "string" },
+          "routine": { "type": "string", "description": "The routine that started the run. Missing for `phantomqa run`." },
           "app": { "type": "string" },
           "goal": { "type": "string" },
           "avoid": { "type": "array", "items": { "type": "string" } },
@@ -125,7 +126,7 @@
       },
       "Agent": {
         "type": "object",
-        "description": "Only for runs started by `phantomqa run`, once the run is over.",
+        "description": "Only for runs started by `phantomqa run` or a routine, once the run is over.",
         "properties": {
           "name": { "type": "string" },
           "model": { "type": "string" },
