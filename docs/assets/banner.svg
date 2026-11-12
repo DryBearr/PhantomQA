@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 380" width="1200" height="380" role="img" aria-labelledby="title desc">
+  <title id="title">PhantomQA</title>
+  <desc id="desc">AI agents test Android apps and report what breaks.</desc>
+  <defs>
+    <clipPath id="card"><rect width="1200" height="380" rx="16"/></clipPath>
+    <radialGradient id="glow" cx="50%" cy="38%" r="55%">
+      <stop offset="0" stop-color="#1c2140" stop-opacity="0.9"/>
+      <stop offset="0.45" stop-color="#11142a" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#07080c" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f1f3ff"/>
+      <stop offset="0.6" stop-color="#c9d1ff" stop-opacity="0.75"/>
+      <stop offset="1" stop-color="#a9b5ff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="sides" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fff"/>
+      <stop offset="0.3" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="0.7" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#fff"/>
+    </linearGradient>
+    <mask id="fade"><rect width="1200" height="380" fill="url(#sides)"/></mask>
+    <linearGradient id="beam" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9aa8ff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#9aa8ff" stop-opacity="0.07"/>
+    </linearGradient>
+    <pattern id="lines" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="1" fill="#ffffff" fill-opacity="0.018"/>
+    </pattern>
+    <filter id="blur" x="-1" y="-1" width="3" height="3"><feGaussianBlur stdDeviation="16"/></filter>
+    <filter id="grain">
+      <feTurbulence type="fractalNoise" baseFrequency="0.85" numOctaves="3" stitchTiles="stitch"/>
+      <feColorMatrix values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0.08 0 0 0 0"/>
+    </filter>
+    <path id="ghost" d="M0 36 A36 36 0 0 1 72 36 V86 q-6 -8 -12 0 t-12 0 t-12 0 t-12 0 t-12 0 t-12 0 Z"/>
+  </defs>
+  <style>
+    .float { animation: float 6s ease-in-out infinite; }
+    .shadow { animation: shadow 6s ease-in-out infinite; transform-box: fill-box; transform-origin: center; }
+    .eyes { animation: blink 7s infinite; transform-box: fill-box; transform-origin: center; }
+    .scan { animation: scan 10s linear infinite; }
+    @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-8px); } }
+    @keyframes shadow { 0%, 100% { transform: scaleX(1); opacity: 1; } 50% { transform: scaleX(0.8); opacity: 0.6; } }
+    @keyframes blink { 0%, 93%, 100% { transform: scaleY(1); } 95% { transform: scaleY(0.1); } }
+    @keyframes scan { from { transform: translateY(-80px); } to { transform: translateY(400px); } }
+    @media (prefers-reduced-motion: reduce) { .float, .shadow, .eyes { animation: none; } .scan { display: none; } }
+    text { font-family: Inter, "Segoe UI", "Helvetica Neue", Cantarell, Arial, sans-serif; }
+    .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  </style>
+
+  <g clip-path="url(#card)">
+    <rect width="1200" height="380" fill="#07080c"/>
+    <rect width="1200" height="380" fill="url(#glow)"/>
+    <rect width="1200" height="380" fill="url(#lines)"/>
+
+    <!-- What PhantomQA sees and finds, as faint traces at the edges -->
+    <g mask="url(#fade)" class="mono" font-size="13" fill="#8a93ad" fill-opacity="0.24">
+      <text x="56" y="62">[1] EditText "Search settings" edit</text>
+      <text x="56" y="88">[2] Button "Sign in" click</text>
+      <text x="56" y="114">[3] RecyclerView #list scroll</text>
+      <text x="56" y="140">[4] Switch "Dark mode" checked</text>
+      <text x="56" y="166">[5] EditText "Password" password</text>
+      <text x="56" y="192">[6] Button "Pay now" avoid</text>
+      <text x="56" y="218">[7] TextView "Network &amp; internet"</text>
+      <text x="56" y="244">[8] ImageButton "Back" click</text>
+      <text x="56" y="270">tap 2: screen changed</text>
+      <text x="56" y="296">scroll down: end of list</text>
+      <text x="56" y="322">keyboard open</text>
+      <g text-anchor="end">
+        <text x="1144" y="62">FATAL EXCEPTION: main</text>
+        <text x="1144" y="88">java.lang.NullPointerException</text>
+        <text x="1144" y="114">at com.example.cart.Checkout.total</text>
+        <text x="1144" y="140">ANR in com.example.shop</text>
+        <text x="1144" y="166">report_bug severity=critical</text>
+        <text x="1144" y="192">bug-01.png  bug-01.mp4  bug-01.log</text>
+        <text x="1144" y="218">session.mp4: 12 parts joined</text>
+        <text x="1144" y="244">GET /v1/runs/3 200</text>
+        <text x="1144" y="270">routine nightly: done</text>
+        <text x="1144" y="296">ended: done, 2 bugs</text>
+        <text x="1144" y="322">run-004</text>
+      </g>
+    </g>
+
+    <rect class="scan" x="0" y="0" width="1200" height="80" fill="url(#beam)"/>
+
+    <!-- The phantom -->
+    <ellipse class="shadow" cx="600" cy="176" rx="30" ry="4" fill="#9aa8ff" fill-opacity="0.16"/>
+    <g class="float">
+      <g transform="translate(564 64)">
+        <use href="#ghost" fill="#8e9dff" fill-opacity="0.55" filter="url(#blur)"/>
+        <use href="#ghost" fill="url(#body)"/>
+        <g class="eyes" fill="#07080c">
+          <ellipse cx="24" cy="40" rx="4.5" ry="6.5"/>
+          <ellipse cx="48" cy="40" rx="4.5" ry="6.5"/>
+        </g>
+      </g>
+    </g>
+
+    <text x="600" y="246" text-anchor="middle" font-size="62" font-weight="300" letter-spacing="1.5" fill="#eceef5">Phantom<tspan fill="#9aa8ff" font-weight="500">QA</tspan></text>
+    <text x="600" y="288" text-anchor="middle" class="mono" font-size="14" letter-spacing="4.5" fill="#6a7184">AI AGENTS TEST ANDROID APPS AND REPORT WHAT BREAKS</text>
+    <line x1="560" y1="322" x2="640" y2="322" stroke="#262a38"/>
+    <text x="600" y="348" text-anchor="middle" class="mono" font-size="11.5" letter-spacing="3.5" fill="#3e4456">RUST · MCP · ADB · MIT</text>
+
+    <rect width="1200" height="380" filter="url(#grain)"/>
+  </g>
+  <rect x="0.5" y="0.5" width="1199" height="379" rx="15.5" fill="none" stroke="#1b1e29"/>
+</svg>

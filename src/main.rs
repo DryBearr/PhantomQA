@@ -3468,7 +3468,7 @@ fn is_v1(url: &str) -> bool {
 /// so a website cannot tell that PhantomQA runs on this machine.
 fn route(req: &ApiRequest, reports: &Path, tokens: &Path) -> (Reply, Option<String>) {
     let (mut reply, who) = answer(req, reports, tokens);
-    if is_v1(req.url) && req.url.len() <= MAX_URL {
+    if is_v1(req.url) {
         reply.headers.push(("Access-Control-Allow-Origin", "*".into()));
         // Headers a page may read besides the basic ones: for video seeking and for 401.
         reply.headers.push((
@@ -6325,6 +6325,22 @@ mod tests {
             );
         }
         assert_eq!(api.request("OPTIONS", "/health", None, None).status, 405);
+        // Errors before any route still reach the page.
+        let long = api.request("GET", &format!("/v1/runs?{}", "x".repeat(3000)), None, None);
+        assert_eq!(
+            (long.status, header(&long, "Access-Control-Allow-Origin")),
+            (414, Some("*"))
+        );
+        let long_check = api.request("OPTIONS", &format!("/v1/runs?{}", "x".repeat(3000)), None, None);
+        assert_eq!(long_check.status, 414);
+        let post = api.request("POST", "/v1/runs", None, None);
+        assert_eq!(
+            (post.status, header(&post, "Access-Control-Allow-Origin")),
+            (405, Some("*"))
+        );
+        // A path that leaves /v1 with ".." is still a /v1 path: token first, then no such route.
+        let sneaky = api.request("GET", "/v1/../health", None, None);
+        assert_eq!(sneaky.status, 401);
         assert!(is_v1("/v1") && is_v1("/v1/runs?limit=2") && !is_v1("/v1x") && !is_v1("/"));
     }
 

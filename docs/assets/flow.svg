@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 330" width="1200" height="330" role="img" aria-labelledby="title desc">
+  <title id="title">How PhantomQA works</title>
+  <desc id="desc">An AI agent talks to PhantomQA over MCP. PhantomQA drives the Android device over adb, and writes each run to a reports folder that the HTTP API serves. phantomqa run starts the agent from a test file.</desc>
+  <defs>
+    <clipPath id="card"><rect width="1200" height="330" rx="16"/></clipPath>
+    <radialGradient id="glow" cx="50%" cy="34%" r="40%">
+      <stop offset="0" stop-color="#1a1f3d" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#07080c" stop-opacity="0"/>
+    </radialGradient>
+    <marker id="head" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L8 4 L0 8 Z" fill="#4a5168"/>
+    </marker>
+  </defs>
+  <style>
+    text { font-family: Inter, "Segoe UI", "Helvetica Neue", Cantarell, Arial, sans-serif; }
+    .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .box { fill: #0c0e14; stroke: #232735; }
+    .core { fill: #0f1220; stroke: #5b67b8; }
+    .name { font-size: 19px; font-weight: 500; fill: #e7e9f1; }
+    .sub { font-size: 12.5px; fill: #6b7387; }
+    .edge { stroke: #3a4054; stroke-width: 1.5; fill: none; }
+    .pulse { stroke: #9aa8ff; stroke-width: 1.5; fill: none; stroke-dasharray: 3 14; stroke-opacity: 0.8; animation: flow 1.8s linear infinite; }
+    .tag { font-size: 11.5px; letter-spacing: 2.5px; fill: #7d86a8; }
+    @keyframes flow { to { stroke-dashoffset: -17; } }
+    @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+  </style>
+
+  <g clip-path="url(#card)">
+    <rect width="1200" height="330" fill="#07080c"/>
+    <rect width="1200" height="330" fill="url(#glow)"/>
+
+    <!-- edges -->
+    <path class="edge" d="M300 100 H468" marker-end="url(#head)" marker-start="url(#head)"/>
+    <path class="pulse" d="M300 100 H468"/>
+    <text class="mono tag" x="384" y="88" text-anchor="middle">MCP</text>
+
+    <path class="edge" d="M732 100 H900" marker-end="url(#head)" marker-start="url(#head)"/>
+    <path class="pulse" d="M732 100 H900"/>
+    <text class="mono tag" x="816" y="88" text-anchor="middle">ADB</text>
+
+    <path class="edge" d="M600 142 V208" marker-end="url(#head)"/>
+    <path class="pulse" d="M600 142 V208"/>
+    <text class="mono tag" x="614" y="180">WRITES</text>
+
+    <path class="edge" d="M732 250 H900" marker-end="url(#head)"/>
+    <path class="pulse" d="M732 250 H900"/>
+    <text class="mono tag" x="816" y="238" text-anchor="middle">SERVE</text>
+
+    <path class="edge" d="M170 208 V148" marker-end="url(#head)"/>
+    <path class="pulse" d="M170 208 V148"/>
+    <text class="mono tag" x="184" y="183">RUN</text>
+
+    <!-- nodes -->
+    <rect class="box" x="40" y="58" width="260" height="84" rx="12"/>
+    <text class="name" x="64" y="94">AI agent</text>
+    <text class="sub mono" x="64" y="118">Claude Code or any MCP client</text>
+
+    <rect class="core" x="470" y="58" width="260" height="84" rx="12"/>
+    <text class="name" x="494" y="94">Phantom<tspan fill="#9aa8ff">QA</tspan></text>
+    <text class="sub mono" x="494" y="118">sees · acts · catches crashes</text>
+
+    <rect class="box" x="902" y="58" width="260" height="84" rx="12"/>
+    <text class="name" x="926" y="94">Android device</text>
+    <text class="sub mono" x="926" y="118">emulator or phone</text>
+
+    <rect class="box" x="40" y="210" width="260" height="84" rx="12"/>
+    <text class="name" x="64" y="246">Test file</text>
+    <text class="sub mono" x="64" y="270">goal · avoid · login · schedule</text>
+
+    <rect class="box" x="470" y="210" width="260" height="84" rx="12"/>
+    <text class="name" x="494" y="246">reports/run-004</text>
+    <text class="sub mono" x="494" y="270">report.md · png · mp4 · log</text>
+
+    <rect class="box" x="902" y="210" width="260" height="84" rx="12"/>
+    <text class="name" x="926" y="246">HTTP API</text>
+    <text class="sub mono" x="926" y="270">token · read-only · CORS</text>
+  </g>
+  <rect x="0.5" y="0.5" width="1199" height="329" rx="15.5" fill="none" stroke="#1b1e29"/>
+</svg>

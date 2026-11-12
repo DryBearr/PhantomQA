@@ -62,6 +62,9 @@ const res = await fetch("http://127.0.0.1:7070/v1/runs", {
 - `/health` and `/openapi.json` have no CORS headers, so other websites cannot tell that PhantomQA runs on your machine.
 - A token in a web page can be seen by everyone who uses the page. Give the dashboard its own token with an expiry (`phantomqa token add dashboard --expires 30d`). Or let the dashboard's server call the API, and keep the token there.
 - Chrome may ask the user before a page on a public website reaches `127.0.0.1` or the local network. PhantomQA answers Chrome's check for that (`Access-Control-Allow-Private-Network: true`), but the user's permission is up to Chrome.
+- Do not set `credentials: "include"` in `fetch`. No cookies are used, and browsers refuse `*` together with credentials.
+- Behind an HTTPS proxy, do not add CORS headers in the proxy too: two `Access-Control-Allow-Origin` headers make browsers refuse the answer.
+- A page served over HTTPS may call `http://127.0.0.1`, but not plain HTTP on another machine (mixed content). Reach another machine through an HTTPS proxy.
 
 ### List runs
 
